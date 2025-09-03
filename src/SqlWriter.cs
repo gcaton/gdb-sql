@@ -22,30 +22,211 @@ public class SqlWriter
         if (!sampleData.Any())
             return;
             
-        using var connection = new SqlConnection(_connectionString);
-        await connection.OpenAsync();
-        
-        // First check if table exists
-        var checkCmd = new SqlCommand(
-            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = @tableName", 
-            connection);
-        checkCmd.Parameters.AddWithValue("@tableName", tableName);
-        
-        var tableExists = ((int?)await checkCmd.ExecuteScalarAsync() ?? 0) > 0;
-        
-        if (!tableExists)
+        try
         {
-            var createTableSql = GenerateCreateTableSql(tableName, sampleData.First());
-            var createCmd = new SqlCommand(createTableSql, connection);
-            await createCmd.ExecuteNonQueryAsync();
-            Console.WriteLine($"    Table '{tableName}' created");
+            using var connection = new SqlConnection(_connectionString);
+            Console.WriteLine($"[SQL] Opening connection for table creation...");
+            await connection.OpenAsync();
+            Console.WriteLine($"[SQL] Connection opened successfully");
+            
+            // First check if table exists
+            var checkCmd = new SqlCommand(
+                "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = @tableName", 
+                connection);
+            checkCmd.Parameters.AddWithValue("@tableName", tableName);
+            
+            Console.WriteLine($"[SQL] Checking if table '{tableName}' exists...");
+            var tableExists = ((int?)await checkCmd.ExecuteScalarAsync() ?? 0) > 0;
+            Console.WriteLine($"[SQL] Table exists check result: {tableExists}");
+            
+            if (!tableExists)
+            {
+                Console.WriteLine($"[SQL] Generating CREATE TABLE SQL for '{tableName}'...");
+                var createTableSql = GenerateCreateTableSql(tableName, sampleData.First());
+                Console.WriteLine($"[SQL] CREATE TABLE SQL: {createTableSql}");
+                
+                var createCmd = new SqlCommand(createTableSql, connection);
+                await createCmd.ExecuteNonQueryAsync();
+                Console.WriteLine($"[SQL] Table '{tableName}' created successfully");
+            }
+            else
+            {
+                Console.WriteLine($"[SQL] Table '{tableName}' already exists");
+            }
         }
-        else
+        catch (Exception ex)
         {
-            Console.WriteLine($"    Table '{tableName}' already exists");
+            Console.WriteLine($"[SQL ERROR] Failed to create table '{tableName}': {ex.Message}");
+            Console.WriteLine($"[SQL ERROR] Stack trace: {ex.StackTrace}");
+            throw;
         }
     }
     
+    public async Task ProcessStreamingBatchAsync(LayerBatch batch)
+    {
+        try
+        {
+            lock (ConsoleWriteLock)
+            {
+                Console.WriteLine($"[SQL] Processing batch for '{batch.LayerName}' - Features: {batch.Features.Count}, FirstBatch: {batch.IsFirstBatch}, LastBatch: {batch.IsLastBatch}");
+            }
+            
+            if (batch.Features.Count == 0 && !batch.IsLastBatch)
+            {
+                lock (ConsoleWriteLock)
+                {
+                    Console.WriteLine($"[SQL] Skipping empty batch for '{batch.LayerName}'");
+                }
+                return;
+            }
+                
+            // Test database connection first
+            await TestConnectionAsync();
+            
+            // Create table on first batch
+            if (batch.IsFirstBatch && batch.Features.Count > 0)
+            {
+                lock (ConsoleWriteLock)
+                {
+                    Console.WriteLine($"[SQL] Creating table '{batch.TableName}' for first batch");
+                }
+                await CreateTableIfNotExistsAsync(batch.TableName, batch.Features);
+            }
+            
+            // Insert data if there are features
+            if (batch.Features.Count > 0)
+            {
+                lock (ConsoleWriteLock)
+                {
+                    Console.WriteLine($"[SQL] Inserting {batch.Features.Count} features into '{batch.TableName}'");
+                }
+                await BulkInsertStreamingAsync(batch.TableName, batch.Features);
+                
+                lock (ConsoleWriteLock)
+                {
+                    Console.WriteLine($"[SQL] Successfully inserted {batch.Features.Count} features into '{batch.TableName}'");
+                }
+            }
+            
+            // Log completion on last batch
+            if (batch.IsLastBatch)
+            {
+                lock (ConsoleWriteLock)
+                {
+                    Console.WriteLine($"[SQL] Consumer completed layer '{batch.LayerName}' -> table '{batch.TableName}'");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            lock (ConsoleWriteLock)
+            {
+                Console.WriteLine($"[SQL ERROR] Failed to process batch for '{batch.LayerName}': {ex.Message}");
+                Console.WriteLine($"[SQL ERROR] Stack trace: {ex.StackTrace}");
+            }
+            throw;
+        }
+    }
+    
+    private async Task TestConnectionAsync()
+    {
+        try
+        {
+            using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync();
+            lock (ConsoleWriteLock)
+            {
+                Console.WriteLine($"[SQL] Database connection test successful");
+            }
+        }
+        catch (Exception ex)
+        {
+            lock (ConsoleWriteLock)
+            {
+                Console.WriteLine($"[SQL ERROR] Database connection failed: {ex.Message}");
+            }
+            throw;
+        }
+    }
+    
+    private static readonly object ConsoleWriteLock = new();
+    
+    private async Task BulkInsertStreamingAsync(string tableName, List<Dictionary<string, object?>> data)
+    {
+        try
+        {
+            Console.WriteLine($"[SQL] Starting bulk insert of {data.Count} records to '{tableName}'");
+            
+            using var connection = new SqlConnection(_connectionString);
+            await connection.OpenAsync();
+            
+            // Create DataTable for bulk copy
+            var dataTable = new DataTable();
+            var firstRow = data.First();
+            
+            Console.WriteLine($"[SQL] Creating DataTable with {firstRow.Keys.Count} columns");
+            
+            // Add columns
+            foreach (var kvp in firstRow)
+            {
+                if (kvp.Key == "GEOMETRY" && IsWindows)
+                {
+                    dataTable.Columns.Add(kvp.Key, typeof(SqlGeography));
+                }
+                else if (kvp.Key == "WKT_GEOMETRY" && !IsWindows)
+                {
+                    dataTable.Columns.Add(kvp.Key, typeof(string));
+                }
+                else if (kvp.Key == "SRID" && !IsWindows)
+                {
+                    dataTable.Columns.Add(kvp.Key, typeof(int));
+                }
+                else
+                {
+                    var columnType = GetSqlDataType(kvp.Value);
+                    dataTable.Columns.Add(kvp.Key, columnType);
+                }
+            }
+            
+            Console.WriteLine($"[SQL] Adding {data.Count} rows to DataTable");
+            
+            // Add rows
+            foreach (var row in data)
+            {
+                var dataRow = dataTable.NewRow();
+                foreach (var kvp in row)
+                {
+                    if (kvp.Key == "GEOMETRY" && kvp.Value is SqlGeography geog && IsWindows)
+                    {
+                        dataRow[kvp.Key] = geog;
+                    }
+                    else
+                    {
+                        dataRow[kvp.Key] = kvp.Value ?? DBNull.Value;
+                    }
+                }
+                dataTable.Rows.Add(dataRow);
+            }
+            
+            Console.WriteLine($"[SQL] Performing bulk copy to '{tableName}'");
+            
+            // Perform bulk copy
+            using var bulkCopy = new SqlBulkCopy(connection);
+            bulkCopy.DestinationTableName = tableName;
+            bulkCopy.BulkCopyTimeout = 300;
+            
+            await bulkCopy.WriteToServerAsync(dataTable);
+            
+            Console.WriteLine($"[SQL] Bulk copy completed successfully for '{tableName}'");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[SQL ERROR] Bulk insert failed for '{tableName}': {ex.Message}");
+            Console.WriteLine($"[SQL ERROR] Stack trace: {ex.StackTrace}");
+            throw;
+        }
+    }
+
     public async Task BulkInsertAsync(string tableName, List<Dictionary<string, object?>> data)
     {
         if (!data.Any())
@@ -118,17 +299,13 @@ public class SqlWriter
             
             await bulkCopy.WriteToServerAsync(dataTable);
             
-            // Show progress
+            // Show progress (thread-safe)
             if (totalBatches > 1)
             {
                 var progress = ((batchNum + 1) * 100) / totalBatches;
-                Console.Write($"\r  Inserting {data.Count} features... {progress}%");
+                // Don't show inline progress when running in parallel to avoid console conflicts
+                // The main thread will show overall progress
             }
-        }
-        
-        if (totalBatches > 1)
-        {
-            Console.Write("\r"); // Clear progress line
         }
     }
     

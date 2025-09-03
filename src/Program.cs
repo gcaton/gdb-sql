@@ -1,6 +1,7 @@
 ﻿using GdbToSql;
 using Microsoft.Extensions.Configuration;
 using System.Runtime.InteropServices;
+using System.Threading.Channels;
 
 try
 {
@@ -36,38 +37,163 @@ try
     Console.WriteLine($"Table prefix: {settings.GdbToSql.TargetTablePrefix}");
     Console.WriteLine();
     
-    // Read all layers from GDB
-    var allLayersData = GdbReader.ReadAllGdbLayers(settings.GdbToSql.SourceGdbPath);
+    // Test database connection first
+    Console.WriteLine("Testing database connection...");
+    var connectionValid = await ConnectionTester.TestDatabaseConnectionAsync(settings.ConnectionStrings.DefaultConnection);
     
-    if (allLayersData.Count == 0)
+    if (!connectionValid)
+    {
+        Console.WriteLine("Database connection failed. Cannot continue.");
+        return;
+    }
+    
+    Console.WriteLine("Database connection successful. Continuing with processing...\n");
+    
+    // Get layer information
+    Console.WriteLine("Getting layer information from GDB...");
+    var layerInfos = GdbReader.GetLayerInfos(settings.GdbToSql.SourceGdbPath);
+    Console.WriteLine($"GetLayerInfos returned {layerInfos.Count} layers");
+    
+    if (layerInfos.Count == 0)
     {
         Console.WriteLine("No layers with features found in GDB");
         return;
     }
     
-    Console.WriteLine($"\nFound {allLayersData.Count} layers with features to process");
-    Console.WriteLine();
-    
-    // Insert into SQL
-    var sqlWriter = new SqlWriter(settings.ConnectionStrings.DefaultConnection);
-    var totalFeatures = 0;
-    
-    foreach (var (layerName, features) in allLayersData)
+    // Set table names
+    foreach (var layerInfo in layerInfos)
     {
-        var tableName = $"{settings.GdbToSql.TargetTablePrefix}{layerName}";
-        
-        Console.WriteLine($"Processing layer '{layerName}' -> table '{tableName}'");
-        
-        await sqlWriter.CreateTableIfNotExistsAsync(tableName, features);
-        
-        Console.Write($"  Inserting {features.Count} features... ");
-        await sqlWriter.BulkInsertAsync(tableName, features);
-        Console.WriteLine("Done");
-        
-        totalFeatures += features.Count;
+        layerInfo.TableName = $"{settings.GdbToSql.TargetTablePrefix}{layerInfo.LayerName}";
     }
     
-    Console.WriteLine($"\nSuccessfully processed {allLayersData.Count} layers with {totalFeatures} total features");
+    var totalFeatures = layerInfos.Sum(l => l.TotalFeatures);
+    Console.WriteLine($"\nFound {layerInfos.Count} layers with {totalFeatures} total features to process");
+    Console.WriteLine("Using streaming producer-consumer pattern for memory efficiency");
+    Console.WriteLine();
+    
+    if (layerInfos.Count == 0)
+    {
+        Console.WriteLine("No layers found - nothing to process");
+        return;
+    }
+    
+    // Create channel for streaming batches
+    var channel = Channel.CreateUnbounded<LayerBatch>();
+    var progress = new StreamingProgress();
+    
+    // Initialize progress tracking
+    foreach (var layerInfo in layerInfos)
+    {
+        progress.UpdateProgress(layerInfo.LayerName, 0, layerInfo.TotalFeatures);
+    }
+    
+    // Start progress reporting task
+    using var cancellationTokenSource = new CancellationTokenSource();
+    var progressTask = Task.Run(async () =>
+    {
+        try
+        {
+            while (!cancellationTokenSource.Token.IsCancellationRequested)
+            {
+                await Task.Delay(2000, cancellationTokenSource.Token);
+                progress.ShowProgress();
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected when cancellation is requested
+        }
+    });
+    
+    // Start consumer tasks
+    var consumerCount = Math.Min(Environment.ProcessorCount, 4); // Limit DB connections
+    Console.WriteLine($"Starting {consumerCount} consumer threads...");
+    
+    var consumers = Enumerable.Range(0, consumerCount).Select(consumerId => Task.Run(async () =>
+    {
+        try
+        {
+            var sqlWriter = new SqlWriter(settings.ConnectionStrings.DefaultConnection);
+            var batchesProcessed = 0;
+            
+            Console.WriteLine($"[Consumer {consumerId}] Started");
+            
+            await foreach (var batch in channel.Reader.ReadAllAsync())
+            {
+                try
+                {
+                    batchesProcessed++;
+                    Console.WriteLine($"[Consumer {consumerId}] Processing batch {batchesProcessed} for layer '{batch.LayerName}' with {batch.Features.Count} features");
+                    
+                    await sqlWriter.ProcessStreamingBatchAsync(batch);
+                    
+                    Console.WriteLine($"[Consumer {consumerId}] Completed batch {batchesProcessed} for layer '{batch.LayerName}'");
+                }
+                catch (Exception batchEx)
+                {
+                    Console.WriteLine($"[Consumer {consumerId} ERROR] Failed to process batch {batchesProcessed}: {batchEx.Message}");
+                    Console.WriteLine($"[Consumer {consumerId} ERROR] Stack trace: {batchEx.StackTrace}");
+                    // Continue processing other batches rather than stopping the consumer
+                }
+            }
+            
+            Console.WriteLine($"[Consumer {consumerId}] Finished after processing {batchesProcessed} batches");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Consumer {consumerId} FATAL ERROR] Consumer failed: {ex.Message}");
+            Console.WriteLine($"[Consumer {consumerId} FATAL ERROR] Stack trace: {ex.StackTrace}");
+            throw;
+        }
+    })).ToArray();
+    
+    // Start producer tasks
+    var producerCount = Math.Min(Environment.ProcessorCount, layerInfos.Count);
+    var semaphore = new SemaphoreSlim(producerCount, producerCount);
+    
+    Console.WriteLine($"Starting {producerCount} producer threads for {layerInfos.Count} layers...");
+    
+    var producers = layerInfos.Select(async layerInfo =>
+    {
+        await semaphore.WaitAsync();
+        try
+        {
+            Console.WriteLine($"[Producer] Starting layer '{layerInfo.LayerName}' with {layerInfo.TotalFeatures} features");
+            await GdbReader.ProduceLayerBatchesAsync(settings.GdbToSql.SourceGdbPath, 
+                layerInfo, channel.Writer, progress, batchSize: 5000);
+            Console.WriteLine($"[Producer] Completed layer '{layerInfo.LayerName}'");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Producer] Error processing layer '{layerInfo.LayerName}': {ex.Message}");
+            throw;
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    });
+    
+    Console.WriteLine("Waiting for all producers to complete...");
+    await Task.WhenAll(producers);
+    
+    Console.WriteLine("All producers completed. Signaling completion to consumers...");
+    // Signal completion to consumers
+    channel.Writer.Complete();
+    
+    Console.WriteLine("Waiting for all consumers to complete...");
+    // Wait for all consumers to complete
+    await Task.WhenAll(consumers);
+    
+    Console.WriteLine("All consumers completed. Stopping progress reporting...");
+    
+    // Stop progress reporting
+    cancellationTokenSource.Cancel();
+    
+    // Final progress update
+    progress.ShowProgress();
+    Console.WriteLine($"\nSuccessfully processed {layerInfos.Count} layers with {totalFeatures} total features using streaming pattern");
+    Console.WriteLine($"Used {producerCount} producer threads and {consumerCount} consumer threads");
 }
 catch (Exception ex)
 {
