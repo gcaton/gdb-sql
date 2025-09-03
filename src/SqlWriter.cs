@@ -51,20 +51,21 @@ public class SqlWriter
             var tableExists = ((int?)await checkCmd.ExecuteScalarAsync() ?? 0) > 0;
             Console.WriteLine($"[SQL] Table exists check result: {tableExists}");
             
-            if (!tableExists)
+            if (tableExists)
             {
-                Console.WriteLine($"[SQL] Generating CREATE TABLE SQL for '{tableName}'...");
-                var createTableSql = GenerateCreateTableSql(tableName, sampleData.First());
-                Console.WriteLine($"[SQL] CREATE TABLE SQL: {createTableSql}");
-                
-                var createCmd = new SqlCommand(createTableSql, connection);
-                await createCmd.ExecuteNonQueryAsync();
-                Console.WriteLine($"[SQL] Table '{tableName}' created successfully");
+                Console.WriteLine($"[SQL] Dropping existing table '{tableName}' to ensure clean data...");
+                var dropCmd = new SqlCommand($"DROP TABLE [{tableName}]", connection);
+                await dropCmd.ExecuteNonQueryAsync();
+                Console.WriteLine($"[SQL] Table '{tableName}' dropped successfully");
             }
-            else
-            {
-                Console.WriteLine($"[SQL] Table '{tableName}' already exists");
-            }
+            
+            Console.WriteLine($"[SQL] Generating CREATE TABLE SQL for '{tableName}'...");
+            var createTableSql = GenerateCreateTableSql(tableName, sampleData.First());
+            Console.WriteLine($"[SQL] CREATE TABLE SQL: {createTableSql}");
+            
+            var createCmd = new SqlCommand(createTableSql, connection);
+            await createCmd.ExecuteNonQueryAsync();
+            Console.WriteLine($"[SQL] Table '{tableName}' created successfully");
         }
         catch (Exception ex)
         {
@@ -178,7 +179,7 @@ public class SqlWriter
             
             Console.WriteLine($"[SQL] Creating DataTable with {firstRow.Keys.Count} columns");
             
-            // Add columns
+            // Add columns with proper data types
             foreach (var kvp in firstRow)
             {
                 if (kvp.Key == "GEOMETRY" && IsWindows)
@@ -195,14 +196,14 @@ public class SqlWriter
                 }
                 else
                 {
-                    var columnType = GetSqlDataType(kvp.Value);
+                    var columnType = GetOptimizedDataType(kvp.Key, kvp.Value);
                     dataTable.Columns.Add(kvp.Key, columnType);
                 }
             }
             
             Console.WriteLine($"[SQL] Adding {data.Count} rows to DataTable");
             
-            // Add rows
+            // Add rows with type conversion
             foreach (var row in data)
             {
                 var dataRow = dataTable.NewRow();
@@ -212,9 +213,14 @@ public class SqlWriter
                     {
                         dataRow[kvp.Key] = geog;
                     }
+                    else if (kvp.Value == null)
+                    {
+                        dataRow[kvp.Key] = DBNull.Value;
+                    }
                     else
                     {
-                        dataRow[kvp.Key] = kvp.Value ?? DBNull.Value;
+                        // Convert to appropriate data type
+                        dataRow[kvp.Key] = ConvertToAppropriateType(kvp.Key, kvp.Value, dataTable.Columns[kvp.Key]?.DataType ?? typeof(string));
                     }
                 }
                 dataTable.Rows.Add(dataRow);
@@ -346,8 +352,23 @@ public class SqlWriter
     {
         if (value == null)
             return typeof(string);
-            
-        return value.GetType();
+        
+        return value switch
+        {
+            int _ => typeof(int),
+            long _ => typeof(long),
+            double _ => typeof(double),
+            float _ => typeof(float),
+            decimal _ => typeof(decimal),
+            DateTime _ => typeof(DateTime),
+            bool _ => typeof(bool),
+            SqlGeography _ => typeof(SqlGeography),
+            string str when DateTime.TryParse(str, out _) => typeof(DateTime),
+            string str when bool.TryParse(str, out _) => typeof(bool),
+            string str when int.TryParse(str, out _) => typeof(int),
+            string str when double.TryParse(str, out _) => typeof(double),
+            _ => typeof(string)
+        };
     }
     
     private string GetSqlColumnType(string columnName, object? sampleValue)
@@ -364,20 +385,157 @@ public class SqlWriter
         if (columnName == "FID")
             return "BIGINT";
             
+        // Handle OBJECTID columns
+        if (columnName.ToUpper() == "OBJECTID" || columnName.ToLower().Contains("objectid"))
+            return "INT";
+            
+        // Handle ID columns - be more conservative
+        if ((columnName.ToLower().EndsWith("id") || columnName.ToLower() == "objectid") && 
+            sampleValue is string idStr && !string.IsNullOrWhiteSpace(idStr) && int.TryParse(idStr, out _))
+            return "INT";
+            
+        // Handle date columns by name pattern
+        if (columnName.ToLower().Contains("date") || columnName.ToLower().Contains("time"))
+        {
+            // Try to parse as DateTime to determine if it's a real date
+            if (sampleValue is string dateStr && DateTime.TryParse(dateStr, out _))
+                return "DATETIME2";
+        }
+        
+        // Handle boolean columns by name pattern
+        if (columnName.ToLower().StartsWith("is") || columnName.ToLower().StartsWith("has") || 
+            columnName.ToLower() == "iscurrent" || sampleValue is bool)
+            return "BIT";
+            
         if (sampleValue == null)
             return "NVARCHAR(255)";
             
         return sampleValue switch
         {
             int _ => "INT",
-            long _ => "BIGINT",
+            long _ => "BIGINT", 
             double _ => "FLOAT",
             float _ => "REAL",
             decimal _ => "DECIMAL(18,6)",
             DateTime _ => "DATETIME2",
             bool _ => "BIT",
             SqlGeography _ => "GEOGRAPHY",
+            string str when str.Length <= 50 => "NVARCHAR(50)",
+            string str when str.Length <= 255 => "NVARCHAR(255)",
+            string str when str.Length <= 1000 => "NVARCHAR(1000)",
+            string _ => "NVARCHAR(MAX)",
             _ => "NVARCHAR(MAX)"
         };
+    }
+    
+    private Type GetOptimizedDataType(string columnName, object? value)
+    {
+        if (value == null)
+            return typeof(string);
+            
+        // Handle special columns - be more conservative
+        if (columnName.ToUpper() == "OBJECTID")
+            return typeof(int);
+            
+        if (columnName == "FID")
+            return typeof(long);
+            
+        // Handle date columns
+        if (columnName.ToLower().Contains("date") || columnName.ToLower().Contains("time"))
+        {
+            if (value is string dateStr && !string.IsNullOrWhiteSpace(dateStr) && DateTime.TryParse(dateStr, out _))
+                return typeof(DateTime);
+        }
+        
+        // Handle boolean columns
+        if (columnName.ToLower().StartsWith("is") || columnName.ToLower().StartsWith("has") || 
+            columnName.ToLower() == "iscurrent")
+        {
+            if (value is string boolStr && !string.IsNullOrWhiteSpace(boolStr) && bool.TryParse(boolStr, out _))
+                return typeof(bool);
+        }
+        
+        return value switch
+        {
+            int _ => typeof(int),
+            long _ => typeof(long),
+            double _ => typeof(double),
+            float _ => typeof(float),
+            decimal _ => typeof(decimal),
+            DateTime _ => typeof(DateTime),
+            bool _ => typeof(bool),
+            SqlGeography _ => typeof(SqlGeography),
+            string str when !string.IsNullOrWhiteSpace(str) && DateTime.TryParse(str, out _) && 
+                           (columnName.ToLower().Contains("date") || columnName.ToLower().Contains("time")) => typeof(DateTime),
+            string str when !string.IsNullOrWhiteSpace(str) && bool.TryParse(str, out _) && 
+                           (columnName.ToLower().StartsWith("is") || columnName.ToLower().StartsWith("has")) => typeof(bool),
+            // Be more conservative with integer detection - only for columns clearly meant to be integers
+            string str when !string.IsNullOrWhiteSpace(str) && int.TryParse(str, out _) && 
+                           (columnName.ToLower().EndsWith("id") || columnName.ToLower() == "objectid") => typeof(int),
+            string str when !string.IsNullOrWhiteSpace(str) && double.TryParse(str, out _) && 
+                           (columnName.ToLower().Contains("factor") || columnName.ToLower().Contains("scale")) => typeof(double),
+            _ => typeof(string)
+        };
+    }
+    
+    private object ConvertToAppropriateType(string columnName, object value, Type targetType)
+    {
+        if (value == null)
+            return DBNull.Value;
+            
+        // Handle empty strings - convert to null for non-string types
+        if (value is string str && string.IsNullOrWhiteSpace(str) && targetType != typeof(string))
+            return DBNull.Value;
+            
+        if (targetType == typeof(DateTime) && value is string dateStr)
+        {
+            if (DateTime.TryParse(dateStr, out DateTime dateResult))
+                return dateResult;
+            return DBNull.Value; // Invalid date becomes null
+        }
+        
+        if (targetType == typeof(bool) && value is string boolStr)
+        {
+            if (bool.TryParse(boolStr, out bool boolResult))
+                return boolResult;
+            // Handle common boolean representations
+            return boolStr.ToLower() switch
+            {
+                "1" or "yes" or "y" or "true" or "t" => true,
+                "0" or "no" or "n" or "false" or "f" => false,
+                _ => DBNull.Value // Invalid boolean becomes null
+            };
+        }
+        
+        if (targetType == typeof(int) && value is string intStr)
+        {
+            if (int.TryParse(intStr, out int intResult))
+                return intResult;
+            return DBNull.Value; // Invalid integer becomes null
+        }
+        
+        if (targetType == typeof(long) && value is string longStr)
+        {
+            if (long.TryParse(longStr, out long longResult))
+                return longResult;
+            return DBNull.Value; // Invalid long becomes null
+        }
+        
+        if (targetType == typeof(double) && value is string doubleStr)
+        {
+            if (double.TryParse(doubleStr, out double doubleResult))
+                return doubleResult;
+            return DBNull.Value; // Invalid double becomes null
+        }
+        
+        if (targetType == typeof(decimal) && value is string decimalStr)
+        {
+            if (decimal.TryParse(decimalStr, out decimal decimalResult))
+                return decimalResult;
+            return DBNull.Value; // Invalid decimal becomes null
+        }
+        
+        // If no conversion needed or possible, return original value
+        return value;
     }
 }
