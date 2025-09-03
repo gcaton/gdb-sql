@@ -402,10 +402,19 @@ public class SqlWriter
                 return "DATETIME2";
         }
         
-        // Handle boolean columns by name pattern
+        // Handle boolean columns by name pattern - be very conservative
         if (columnName.ToLower().StartsWith("is") || columnName.ToLower().StartsWith("has") || 
-            columnName.ToLower() == "iscurrent" || sampleValue is bool)
-            return "BIT";
+            columnName.ToLower() == "iscurrent")
+        {
+            if (sampleValue is string boolStr && !string.IsNullOrWhiteSpace(boolStr))
+            {
+                var lower = boolStr.ToLower();
+                if (lower is "true" or "false" or "1" or "0" or "yes" or "no" or "y" or "n" or "t" or "f")
+                    return "BIT";
+            }
+            else if (sampleValue is bool)
+                return "BIT";
+        }
             
         if (sampleValue == null)
             return "NVARCHAR(255)";
@@ -447,12 +456,17 @@ public class SqlWriter
                 return typeof(DateTime);
         }
         
-        // Handle boolean columns
+        // Handle boolean columns - be very conservative
         if (columnName.ToLower().StartsWith("is") || columnName.ToLower().StartsWith("has") || 
             columnName.ToLower() == "iscurrent")
         {
-            if (value is string boolStr && !string.IsNullOrWhiteSpace(boolStr) && bool.TryParse(boolStr, out _))
-                return typeof(bool);
+            if (value is string boolStr && !string.IsNullOrWhiteSpace(boolStr))
+            {
+                // Only treat as boolean if it's a clear boolean value
+                var lower = boolStr.ToLower();
+                if (lower is "true" or "false" or "1" or "0" or "yes" or "no" or "y" or "n" or "t" or "f")
+                    return typeof(bool);
+            }
         }
         
         return value switch
@@ -467,8 +481,9 @@ public class SqlWriter
             SqlGeography _ => typeof(SqlGeography),
             string str when !string.IsNullOrWhiteSpace(str) && DateTime.TryParse(str, out _) && 
                            (columnName.ToLower().Contains("date") || columnName.ToLower().Contains("time")) => typeof(DateTime),
-            string str when !string.IsNullOrWhiteSpace(str) && bool.TryParse(str, out _) && 
-                           (columnName.ToLower().StartsWith("is") || columnName.ToLower().StartsWith("has")) => typeof(bool),
+            string str when !string.IsNullOrWhiteSpace(str) && 
+                           (columnName.ToLower().StartsWith("is") || columnName.ToLower().StartsWith("has")) &&
+                           str.ToLower() is "true" or "false" or "1" or "0" or "yes" or "no" or "y" or "n" or "t" or "f" => typeof(bool),
             // Be more conservative with integer detection - only for columns clearly meant to be integers
             string str when !string.IsNullOrWhiteSpace(str) && int.TryParse(str, out _) && 
                            (columnName.ToLower().EndsWith("id") || columnName.ToLower() == "objectid") => typeof(int),
@@ -503,6 +518,7 @@ public class SqlWriter
             {
                 "1" or "yes" or "y" or "true" or "t" => true,
                 "0" or "no" or "n" or "false" or "f" => false,
+                "undefined" or "null" or "" => DBNull.Value, // Handle undefined/null values
                 _ => DBNull.Value // Invalid boolean becomes null
             };
         }
