@@ -394,12 +394,17 @@ public class SqlWriter
             sampleValue is string idStr && !string.IsNullOrWhiteSpace(idStr) && int.TryParse(idStr, out _))
             return "INT";
             
-        // Handle date columns by name pattern
+        // Handle date columns by name pattern - be very conservative
         if (columnName.ToLower().Contains("date") || columnName.ToLower().Contains("time"))
         {
             // Try to parse as DateTime to determine if it's a real date
-            if (sampleValue is string dateStr && DateTime.TryParse(dateStr, out _))
-                return "DATETIME2";
+            if (sampleValue is string dateStr && !string.IsNullOrWhiteSpace(dateStr) && 
+                DateTime.TryParse(dateStr, out DateTime parsedDate) && parsedDate != DateTime.MinValue)
+            {
+                // Additional validation - must look like a reasonable date
+                if (parsedDate.Year > 1900 && parsedDate.Year < 2100)
+                    return "DATETIME2";
+            }
         }
         
         // Handle boolean columns by name pattern - be very conservative
@@ -449,11 +454,16 @@ public class SqlWriter
         if (columnName == "FID")
             return typeof(long);
             
-        // Handle date columns
+        // Handle date columns - be very conservative
         if (columnName.ToLower().Contains("date") || columnName.ToLower().Contains("time"))
         {
-            if (value is string dateStr && !string.IsNullOrWhiteSpace(dateStr) && DateTime.TryParse(dateStr, out _))
-                return typeof(DateTime);
+            if (value is string dateStr && !string.IsNullOrWhiteSpace(dateStr) && 
+                DateTime.TryParse(dateStr, out DateTime parsedDate) && parsedDate != DateTime.MinValue)
+            {
+                // Additional validation - must look like a reasonable date
+                if (parsedDate.Year > 1900 && parsedDate.Year < 2100)
+                    return typeof(DateTime);
+            }
         }
         
         // Handle boolean columns - be very conservative
@@ -479,8 +489,10 @@ public class SqlWriter
             DateTime _ => typeof(DateTime),
             bool _ => typeof(bool),
             SqlGeography _ => typeof(SqlGeography),
-            string str when !string.IsNullOrWhiteSpace(str) && DateTime.TryParse(str, out _) && 
-                           (columnName.ToLower().Contains("date") || columnName.ToLower().Contains("time")) => typeof(DateTime),
+            string str when !string.IsNullOrWhiteSpace(str) && 
+                           (columnName.ToLower().Contains("date") || columnName.ToLower().Contains("time")) &&
+                           DateTime.TryParse(str, out DateTime parsedDate) && parsedDate != DateTime.MinValue &&
+                           parsedDate.Year > 1900 && parsedDate.Year < 2100 => typeof(DateTime),
             string str when !string.IsNullOrWhiteSpace(str) && 
                            (columnName.ToLower().StartsWith("is") || columnName.ToLower().StartsWith("has")) &&
                            str.ToLower() is "true" or "false" or "1" or "0" or "yes" or "no" or "y" or "n" or "t" or "f" => typeof(bool),
