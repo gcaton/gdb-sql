@@ -1,4 +1,5 @@
 using System.Threading.Channels;
+using Spectre.Console;
 
 namespace GdbToSql;
 
@@ -39,8 +40,17 @@ public class StreamingProgress
             var totalProcessed = _layerProgress.Values.Sum(p => p.Processed);
             var totalFeatures = _layerProgress.Values.Sum(p => p.Total);
             var completedLayers = _layerProgress.Count(p => p.Value.Processed == p.Value.Total);
+            var percentage = totalFeatures > 0 ? (double)totalProcessed / totalFeatures * 100 : 0;
             
-            Console.WriteLine($"Progress: {completedLayers}/{_layerProgress.Count} layers complete, {totalProcessed}/{totalFeatures} features processed");
+            AnsiConsole.MarkupLine($"[green]✓ Final Progress:[/] [cyan]{completedLayers}[/]/[yellow]{_layerProgress.Count}[/] layers complete, [cyan]{totalProcessed:N0}[/]/[yellow]{totalFeatures:N0}[/] features processed ([green]{percentage:F1}%[/])");
+        }
+    }
+    
+    public long GetTotalProcessed()
+    {
+        lock (_lock)
+        {
+            return _layerProgress.Values.Sum(p => p.Processed);
         }
     }
 }

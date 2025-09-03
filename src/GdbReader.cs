@@ -5,6 +5,7 @@ using OSGeo.OSR;
 using System.Data.SqlTypes;
 using System.Runtime.InteropServices;
 using System.Threading.Channels;
+using Spectre.Console;
 
 namespace GdbToSql;
 
@@ -30,7 +31,7 @@ public class GdbReader
             }
 
             var layerCount = dataSource.GetLayerCount();
-            Console.WriteLine($"Found {layerCount} layers in GDB");
+            // Found layers
 
             for (int layerIndex = 0; layerIndex < layerCount; layerIndex++)
             {
@@ -41,7 +42,7 @@ public class GdbReader
                 if (featureCount > 0)
                 {
                     layerInfos.Add((layerIndex, layerName, featureCount));
-                    Console.WriteLine($"Layer '{layerName}': {featureCount} features");
+                    // Layer info collected
                 }
             }
         }
@@ -51,7 +52,7 @@ public class GdbReader
             return new Dictionary<string, List<Dictionary<string, object?>>>();
         }
         
-        Console.WriteLine($"\nReading {layerInfos.Count} layers in parallel...");
+        // Reading layers in parallel
         
         // Process layers in parallel
         var allLayersData = new Dictionary<string, List<Dictionary<string, object?>>>();
@@ -76,7 +77,7 @@ public class GdbReader
                         allLayersData[layerInfo.Name] = features;
                     }
                     completedLayers++;
-                    Console.WriteLine($"[Thread {Thread.CurrentThread.ManagedThreadId}] Completed layer '{layerInfo.Name}': {features.Count} features ({completedLayers}/{layerInfos.Count})");
+                    // Layer completed
                 }
             }
             finally
@@ -87,7 +88,7 @@ public class GdbReader
         
         await Task.WhenAll(tasks);
         
-        Console.WriteLine($"Successfully read {allLayersData.Count} layers using {maxConcurrency} concurrent threads\n");
+        // All layers read successfully
         
         return allLayersData;
     }
@@ -105,7 +106,7 @@ public class GdbReader
         }
 
         var layerCount = dataSource.GetLayerCount();
-        Console.WriteLine($"Found {layerCount} layers in GDB");
+        // Found layers
 
         for (int layerIndex = 0; layerIndex < layerCount; layerIndex++)
         {
@@ -122,7 +123,7 @@ public class GdbReader
                     TotalFeatures = featureCount,
                     LayerIndex = layerIndex
                 });
-                Console.WriteLine($"Layer '{layerName}': {featureCount} features");
+                // Layer found for streaming
             }
         }
         
@@ -266,7 +267,7 @@ public class GdbReader
                     {
                         lock (ConsoleWriteLock)
                         {
-                            Console.WriteLine($"[Producer] Sending batch of {batch.Count} features for layer '{layerInfo.LayerName}' ({processedCount}/{layerInfo.TotalFeatures})");
+                            // Sending batch silently
                         }
                         
                         await writer.WriteAsync(new LayerBatch
@@ -289,7 +290,7 @@ public class GdbReader
                 {
                     lock (ConsoleWriteLock)
                     {
-                        Console.WriteLine($"[Producer] Sending final batch of {batch.Count} features for layer '{layerInfo.LayerName}'");
+                        // Final batch sent
                     }
                     
                     await writer.WriteAsync(new LayerBatch
@@ -305,7 +306,7 @@ public class GdbReader
                 {
                     lock (ConsoleWriteLock)
                     {
-                        Console.WriteLine($"[Producer] Sending completion marker for layer '{layerInfo.LayerName}'");
+                        // Completion marker sent
                     }
                     
                     // Mark the previous batch as the last batch
@@ -323,7 +324,7 @@ public class GdbReader
                 
                 lock (ConsoleWriteLock)
                 {
-                    Console.WriteLine($"[Thread {Thread.CurrentThread.ManagedThreadId}] Producer completed layer '{layerInfo.LayerName}': {processedCount} features");
+                    // Producer completed layer
                 }
             }
             catch (Exception ex)

@@ -2,20 +2,34 @@
 using Microsoft.Extensions.Configuration;
 using System.Runtime.InteropServices;
 using System.Threading.Channels;
+using Spectre.Console;
 
 try
 {
     var totalTimer = System.Diagnostics.Stopwatch.StartNew();
     var timings = new Dictionary<string, TimeSpan>();
     
-    Console.WriteLine("GDB to SQL Converter");
-    Console.WriteLine("====================");
+    // Create a nice header
+    var rule = new Rule("[bold blue]GDB to SQL Converter[/]");
+    rule.Style = Style.Parse("blue");
+    AnsiConsole.Write(rule);
+    AnsiConsole.WriteLine();
     
-    // Display platform and geometry format
+    // Display platform and geometry format in a nice panel
     var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
-    Console.WriteLine($"Platform: {RuntimeInformation.OSDescription}");
-    Console.WriteLine($"Geometry format: {(isWindows ? "SQL Geography" : "WKT with SRID column")}");
-    Console.WriteLine();
+    var panel = new Panel(new Markup($"""
+        [bold yellow]Platform:[/] {RuntimeInformation.OSDescription}
+        [bold yellow]Geometry Format:[/] {(isWindows ? "[green]SQL Geography[/]" : "[cyan]WKT with SRID column[/]")}
+        [bold yellow]Multi-threading:[/] [green]Enabled[/]
+        [bold yellow]Memory optimization:[/] [green]Producer-Consumer Pattern[/]
+        """))
+    {
+        Header = new PanelHeader("[bold green]System Information[/]"),
+        Border = BoxBorder.Rounded,
+        BorderStyle = Style.Parse("green")
+    };
+    AnsiConsole.Write(panel);
+    AnsiConsole.WriteLine();
     
     // Load configuration
     var configTimer = System.Diagnostics.Stopwatch.StartNew();
@@ -39,38 +53,60 @@ try
     if (string.IsNullOrEmpty(settings.GdbToSql.SourceGdbPath))
         throw new ArgumentException("Source GDB path is not configured");
     
-    Console.WriteLine($"Reading from GDB: {settings.GdbToSql.SourceGdbPath}");
-    Console.WriteLine($"Table prefix: {settings.GdbToSql.TargetTablePrefix}");
-    Console.WriteLine();
+    // Display configuration in a nice table
+    var configTable = new Table()
+        .BorderColor(Color.Grey)
+        .Border(TableBorder.Rounded)
+        .AddColumn(new TableColumn("[bold yellow]Setting[/]"))
+        .AddColumn(new TableColumn("[bold cyan]Value[/]"))
+        .AddRow("GDB Source", $"[green]{settings.GdbToSql.SourceGdbPath}[/]")
+        .AddRow("Table Prefix", $"[green]{settings.GdbToSql.TargetTablePrefix}[/]");
+        
+    AnsiConsole.Write(configTable);
+    AnsiConsole.WriteLine();
     
     // Test database connection first
     var dbTestTimer = System.Diagnostics.Stopwatch.StartNew();
-    Console.WriteLine("Testing database connection...");
-    var connectionValid = await ConnectionTester.TestDatabaseConnectionAsync(settings.ConnectionStrings.DefaultConnection);
-    dbTestTimer.Stop();
-    timings["Database Connection Test"] = dbTestTimer.Elapsed;
     
-    if (!connectionValid)
-    {
-        Console.WriteLine("Database connection failed. Cannot continue.");
-        return;
-    }
-    
-    Console.WriteLine("Database connection successful. Continuing with processing...\n");
+    await AnsiConsole.Status()
+        .Spinner(Spinner.Known.Star)
+        .SpinnerStyle(Style.Parse("green bold"))
+        .StartAsync("[yellow]Testing database connection...[/]", async ctx =>
+        {
+            var connectionValid = await ConnectionTester.TestDatabaseConnectionAsync(settings.ConnectionStrings.DefaultConnection);
+            dbTestTimer.Stop();
+            timings["Database Connection Test"] = dbTestTimer.Elapsed;
+            
+            if (!connectionValid)
+            {
+                AnsiConsole.MarkupLine("[bold red]✗ Database connection failed. Cannot continue.[/]");
+                Environment.Exit(1);
+            }
+            
+            AnsiConsole.MarkupLine("[bold green]✓ Database connection successful![/]");
+        });
     
     // Get layer information
     var layerInfoTimer = System.Diagnostics.Stopwatch.StartNew();
-    Console.WriteLine("Getting layer information from GDB...");
-    var layerInfos = GdbReader.GetLayerInfos(settings.GdbToSql.SourceGdbPath);
-    layerInfoTimer.Stop();
-    timings["Layer Information Scan"] = layerInfoTimer.Elapsed;
-    Console.WriteLine($"GetLayerInfos returned {layerInfos.Count} layers");
+    List<LayerInfo> layerInfos = null!;
+    
+    await AnsiConsole.Status()
+        .Spinner(Spinner.Known.Dots)
+        .SpinnerStyle(Style.Parse("cyan bold"))
+        .StartAsync("[yellow]Scanning GDB layers...[/]", async ctx =>
+        {
+            layerInfos = await Task.Run(() => GdbReader.GetLayerInfos(settings.GdbToSql.SourceGdbPath));
+            layerInfoTimer.Stop();
+            timings["Layer Information Scan"] = layerInfoTimer.Elapsed;
+        });
     
     if (layerInfos.Count == 0)
     {
-        Console.WriteLine("No layers with features found in GDB");
+        AnsiConsole.MarkupLine("[bold red]✗ No layers with features found in GDB[/]");
         return;
     }
+    
+    AnsiConsole.MarkupLine($"[bold green]✓ Found {layerInfos.Count} layers with features[/]");
     
     // Set table names
     foreach (var layerInfo in layerInfos)
@@ -79,13 +115,44 @@ try
     }
     
     var totalFeatures = layerInfos.Sum(l => l.TotalFeatures);
-    Console.WriteLine($"\nFound {layerInfos.Count} layers with {totalFeatures} total features to process");
-    Console.WriteLine("Using streaming producer-consumer pattern for memory efficiency");
-    Console.WriteLine();
+    
+    // Display layer summary in a nice table
+    var layerTable = new Table()
+        .BorderColor(Color.Grey)
+        .Border(TableBorder.Rounded)
+        .AddColumn(new TableColumn("[bold yellow]Layer[/]").LeftAligned())
+        .AddColumn(new TableColumn("[bold cyan]Features[/]").RightAligned())
+        .AddColumn(new TableColumn("[bold green]Target Table[/]").LeftAligned());
+    
+    foreach (var layer in layerInfos.Take(10)) // Show first 10 layers
+    {
+        layerTable.AddRow(layer.LayerName, layer.TotalFeatures.ToString("N0"), layer.TableName);
+    }
+    
+    if (layerInfos.Count > 10)
+    {
+        layerTable.AddRow($"[dim]... and {layerInfos.Count - 10} more layers[/]", "[dim]...[/]", "[dim]...[/]");
+    }
+    
+    AnsiConsole.Write(layerTable);
+    
+    // Summary panel
+    var summaryPanel = new Panel(new Markup($"""
+        [bold yellow]Total Layers:[/] {layerInfos.Count:N0}
+        [bold yellow]Total Features:[/] {totalFeatures:N0}
+        [bold yellow]Processing Pattern:[/] [green]Streaming Producer-Consumer[/]
+        [bold yellow]Memory Optimization:[/] [green]Enabled[/]
+        """))
+    {
+        Header = new PanelHeader("[bold green]Processing Summary[/]"),
+        Border = BoxBorder.Rounded,
+        BorderStyle = Style.Parse("green")
+    };
+    AnsiConsole.Write(summaryPanel);
     
     if (layerInfos.Count == 0)
     {
-        Console.WriteLine("No layers found - nothing to process");
+        AnsiConsole.MarkupLine("[bold red]✗ No layers found - nothing to process[/]");
         return;
     }
     
@@ -99,7 +166,7 @@ try
         progress.UpdateProgress(layerInfo.LayerName, 0, layerInfo.TotalFeatures);
     }
     
-    // Start progress reporting task
+    // Start progress reporting task with Spectre.Console
     using var cancellationTokenSource = new CancellationTokenSource();
     var progressTask = Task.Run(async () =>
     {
@@ -107,8 +174,13 @@ try
         {
             while (!cancellationTokenSource.Token.IsCancellationRequested)
             {
-                await Task.Delay(2000, cancellationTokenSource.Token);
-                progress.ShowProgress();
+                await Task.Delay(3000, cancellationTokenSource.Token);
+                
+                // Update progress display
+                var processed = progress.GetTotalProcessed();
+                var percentage = totalFeatures > 0 ? (double)processed / totalFeatures * 100 : 0;
+                
+                AnsiConsole.MarkupLine($"[yellow]Progress:[/] [green]{processed:N0}[/] / [cyan]{totalFeatures:N0}[/] features ([green]{percentage:F1}%[/])");
             }
         }
         catch (OperationCanceledException)
@@ -119,7 +191,6 @@ try
     
     // Start consumer tasks
     var consumerCount = Math.Min(Environment.ProcessorCount, 4); // Limit DB connections
-    Console.WriteLine($"Starting {consumerCount} consumer threads...");
     
     var consumers = Enumerable.Range(0, consumerCount).Select(consumerId => Task.Run(async () =>
     {
@@ -128,33 +199,29 @@ try
             var sqlWriter = new SqlWriter(settings.ConnectionStrings.DefaultConnection);
             var batchesProcessed = 0;
             
-            Console.WriteLine($"[Consumer {consumerId}] Started");
+            // Reduced logging for cleaner Spectre.Console output
             
             await foreach (var batch in channel.Reader.ReadAllAsync())
             {
                 try
                 {
                     batchesProcessed++;
-                    Console.WriteLine($"[Consumer {consumerId}] Processing batch {batchesProcessed} for layer '{batch.LayerName}' with {batch.Features.Count} features");
+                    // Only log significant events or errors
                     
                     await sqlWriter.ProcessStreamingBatchAsync(batch);
-                    
-                    Console.WriteLine($"[Consumer {consumerId}] Completed batch {batchesProcessed} for layer '{batch.LayerName}'");
                 }
                 catch (Exception batchEx)
                 {
-                    Console.WriteLine($"[Consumer {consumerId} ERROR] Failed to process batch {batchesProcessed}: {batchEx.Message}");
-                    Console.WriteLine($"[Consumer {consumerId} ERROR] Stack trace: {batchEx.StackTrace}");
+                    AnsiConsole.MarkupLine($"[red]✗ Consumer {consumerId} failed batch {batchesProcessed}: {batchEx.Message.EscapeMarkup()}[/]");
                     // Continue processing other batches rather than stopping the consumer
                 }
             }
             
-            Console.WriteLine($"[Consumer {consumerId}] Finished after processing {batchesProcessed} batches");
+            AnsiConsole.MarkupLine($"[green]✓ Consumer {consumerId} finished processing {batchesProcessed} batches[/]");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Consumer {consumerId} FATAL ERROR] Consumer failed: {ex.Message}");
-            Console.WriteLine($"[Consumer {consumerId} FATAL ERROR] Stack trace: {ex.StackTrace}");
+            AnsiConsole.MarkupLine($"[bold red]✗ Consumer {consumerId} fatal error: {ex.Message.EscapeMarkup()}[/]");
             throw;
         }
     })).ToArray();
@@ -163,30 +230,32 @@ try
     var producerCount = Math.Min(Environment.ProcessorCount, layerInfos.Count);
     var semaphore = new SemaphoreSlim(producerCount, producerCount);
     
-    Console.WriteLine($"Starting {producerCount} producer threads for {layerInfos.Count} layers...");
+    AnsiConsole.MarkupLine($"[yellow]Starting[/] [green]{consumerCount} consumer threads[/] [yellow]and[/] [green]{producerCount} producer threads[/]...");
     
     // Calculate optimal batch size based on layer characteristics
     var optimalBatchSize = CalculateOptimalBatchSize(layerInfos);
-    Console.WriteLine($"Using dynamic batch size: {optimalBatchSize} features per batch");
+    
+    AnsiConsole.MarkupLine($"[yellow]Using dynamic batch size:[/] [green]{optimalBatchSize:N0} features per batch[/]");
     
     // Monitor memory usage
     GC.Collect();
     var initialMemory = GC.GetTotalMemory(false) / (1024 * 1024);
-    Console.WriteLine($"Initial memory usage: {initialMemory} MB");
+    AnsiConsole.MarkupLine($"[yellow]Initial memory usage:[/] [green]{initialMemory} MB[/]");
+    AnsiConsole.WriteLine();
     
     var producers = layerInfos.Select(async layerInfo =>
     {
         await semaphore.WaitAsync();
         try
         {
-            Console.WriteLine($"[Producer] Starting layer '{layerInfo.LayerName}' with {layerInfo.TotalFeatures} features");
+            AnsiConsole.MarkupLine($"[cyan]→ Processing layer [bold]{layerInfo.LayerName}[/] ({layerInfo.TotalFeatures:N0} features)[/]");
             await GdbReader.ProduceLayerBatchesAsync(settings.GdbToSql.SourceGdbPath, 
                 layerInfo, channel.Writer, progress, batchSize: optimalBatchSize);
-            Console.WriteLine($"[Producer] Completed layer '{layerInfo.LayerName}'");
+            AnsiConsole.MarkupLine($"[green]✓ Completed layer [bold]{layerInfo.LayerName}[/][/]");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[Producer] Error processing layer '{layerInfo.LayerName}': {ex.Message}");
+            AnsiConsole.MarkupLine($"[red]✗ Producer error on layer [bold]{layerInfo.LayerName}[/]: {ex.Message.EscapeMarkup()}[/]");
             throw;
         }
         finally
@@ -196,23 +265,33 @@ try
     });
     
     var processingTimer = System.Diagnostics.Stopwatch.StartNew();
-    Console.WriteLine("Waiting for all producers to complete...");
-    await Task.WhenAll(producers);
+    
+    await AnsiConsole.Status()
+        .Spinner(Spinner.Known.Clock)
+        .SpinnerStyle(Style.Parse("yellow bold"))
+        .StartAsync("[yellow]Processing all layers...[/]", async ctx =>
+        {
+            await Task.WhenAll(producers);
+        });
+    
     var producerTime = processingTimer.Elapsed;
     timings["Producer Processing"] = producerTime;
     
-    Console.WriteLine("All producers completed. Signaling completion to consumers...");
+    AnsiConsole.MarkupLine("[green]✓ All producers completed. Finalizing data import...[/]");
     // Signal completion to consumers
     channel.Writer.Complete();
     
-    Console.WriteLine("Waiting for all consumers to complete...");
-    // Wait for all consumers to complete
-    await Task.WhenAll(consumers);
+    await AnsiConsole.Status()
+        .Spinner(Spinner.Known.BouncingBall)
+        .SpinnerStyle(Style.Parse("cyan bold"))
+        .StartAsync("[cyan]Finalizing database operations...[/]", async ctx =>
+        {
+            await Task.WhenAll(consumers);
+        });
+    
     processingTimer.Stop();
     timings["Total Data Processing"] = processingTimer.Elapsed;
     timings["Consumer Processing"] = processingTimer.Elapsed - producerTime;
-    
-    Console.WriteLine("All consumers completed. Stopping progress reporting...");
     
     // Stop progress reporting
     cancellationTokenSource.Cancel();
@@ -223,34 +302,85 @@ try
     // Final memory check
     GC.Collect();
     var finalMemory = GC.GetTotalMemory(false) / (1024 * 1024);
-    Console.WriteLine($"\nFinal memory usage: {finalMemory} MB (delta: {finalMemory - initialMemory} MB)");
+    AnsiConsole.MarkupLine($"[yellow]Final memory usage:[/] [green]{finalMemory} MB[/] [dim](delta: {finalMemory - initialMemory:+#;-#;0} MB)[/]");
     
     totalTimer.Stop();
     timings["Total Application Time"] = totalTimer.Elapsed;
     
-    Console.WriteLine($"\nSuccessfully processed {layerInfos.Count} layers with {totalFeatures} total features using streaming pattern");
-    Console.WriteLine($"Used {producerCount} producer threads and {consumerCount} consumer threads with batch size {optimalBatchSize}");
-    
-    // Display timing summary
-    Console.WriteLine("\n" + new string('=', 50));
-    Console.WriteLine("PERFORMANCE TIMING SUMMARY");
-    Console.WriteLine(new string('=', 50));
-    foreach (var timing in timings.OrderBy(t => t.Value))
+    // Success message
+    AnsiConsole.WriteLine();
+    var successPanel = new Panel(new Markup($"""
+        [bold green]✓ Import completed successfully![/]
+        
+        [bold yellow]Processed:[/] {layerInfos.Count:N0} layers with {totalFeatures:N0} total features
+        [bold yellow]Pattern:[/] Streaming producer-consumer architecture  
+        [bold yellow]Threads:[/] {producerCount} producers, {consumerCount} consumers
+        [bold yellow]Batch Size:[/] {optimalBatchSize:N0} features per batch
+        """))
     {
-        Console.WriteLine($"{timing.Key,-30}: {timing.Value.TotalSeconds:F2}s");
+        Header = new PanelHeader("[bold green]Import Complete[/]"),
+        Border = BoxBorder.Double,
+        BorderStyle = Style.Parse("green bold")
+    };
+    AnsiConsole.Write(successPanel);
+    
+    // Display timing summary with Spectre.Console
+    AnsiConsole.WriteLine();
+    var timingRule = new Rule("[bold green]Performance Summary[/]");
+    timingRule.Style = Style.Parse("green");
+    AnsiConsole.Write(timingRule);
+    
+    // Create timing table
+    var timingTable = new Table()
+        .BorderColor(Color.Green)
+        .Border(TableBorder.Rounded)
+        .AddColumn(new TableColumn("[bold yellow]Phase[/]").LeftAligned())
+        .AddColumn(new TableColumn("[bold cyan]Duration[/]").RightAligned())
+        .AddColumn(new TableColumn("[bold green]Percentage[/]").RightAligned());
+    
+    var totalTime = timings["Total Application Time"].TotalSeconds;
+    foreach (var timing in timings.OrderByDescending(t => t.Value))
+    {
+        var percentage = (timing.Value.TotalSeconds / totalTime) * 100;
+        timingTable.AddRow(
+            timing.Key,
+            $"{timing.Value.TotalSeconds:F2}s",
+            $"{percentage:F1}%"
+        );
     }
-    Console.WriteLine(new string('=', 50));
-    Console.WriteLine($"{"Features per second",-30}: {totalFeatures / timings["Total Data Processing"].TotalSeconds:F0}");
-    Console.WriteLine($"{"MB processed per second",-30}: {finalMemory / timings["Total Data Processing"].TotalSeconds:F2}");
-    Console.WriteLine(new string('=', 50));
+    
+    AnsiConsole.Write(timingTable);
+    
+    // Performance metrics panel
+    var performancePanel = new Panel(new Markup($"""
+        [bold yellow]Features per second:[/] [green]{totalFeatures / timings["Total Data Processing"].TotalSeconds:F0}[/]
+        [bold yellow]Memory efficiency:[/] [green]{finalMemory / timings["Total Data Processing"].TotalSeconds:F2} MB/sec[/]
+        [bold yellow]Batch size:[/] [green]{optimalBatchSize:N0}[/]
+        [bold yellow]Thread utilization:[/] [green]{producerCount} producers, {consumerCount} consumers[/]
+        """))
+    {
+        Header = new PanelHeader("[bold green]Performance Metrics[/]"),
+        Border = BoxBorder.Rounded,
+        BorderStyle = Style.Parse("green")
+    };
+    AnsiConsole.Write(performancePanel);
 }
 catch (Exception ex)
 {
-    Console.WriteLine($"\nError: {ex.Message}");
-    if (ex.InnerException != null)
+    AnsiConsole.WriteLine();
+    var errorPanel = new Panel(new Markup($"""
+        [bold red]✗ Import failed with error:[/]
+        
+        [red]{ex.Message.EscapeMarkup()}[/]
+        
+        {(ex.InnerException != null ? $"[dim]Inner error: {ex.InnerException.Message.EscapeMarkup()}[/]" : "")}
+        """))
     {
-        Console.WriteLine($"Inner error: {ex.InnerException.Message}");
-    }
+        Header = new PanelHeader("[bold red]Error[/]"),
+        Border = BoxBorder.Double,
+        BorderStyle = Style.Parse("red bold")
+    };
+    AnsiConsole.Write(errorPanel);
     Environment.Exit(1);
 }
 

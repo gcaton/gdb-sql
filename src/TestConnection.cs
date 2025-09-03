@@ -1,4 +1,5 @@
 using Microsoft.Data.SqlClient;
+using Spectre.Console;
 
 namespace GdbToSql;
 
@@ -8,26 +9,21 @@ public static class ConnectionTester
     {
         try
         {
-            Console.WriteLine($"[TEST] Testing connection: {connectionString}");
+            // Testing connection silently
             
             using var connection = new SqlConnection(connectionString);
-            Console.WriteLine($"[TEST] Opening connection...");
-            
             await connection.OpenAsync();
-            Console.WriteLine($"[TEST] Connection opened successfully");
             
             var cmd = new SqlCommand("SELECT 1", connection);
             var result = await cmd.ExecuteScalarAsync();
             
-            Console.WriteLine($"[TEST] Test query result: {result}");
-            Console.WriteLine($"[TEST] Database connection test PASSED");
+            // Connection test passed
             
             return true;
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[TEST ERROR] Database connection test FAILED: {ex.Message}");
-            Console.WriteLine($"[TEST ERROR] Stack trace: {ex.StackTrace}");
+            AnsiConsole.MarkupLine($"[red]✗ Database connection test failed: {ex.Message.EscapeMarkup()}[/]");
             return false;
         }
     }

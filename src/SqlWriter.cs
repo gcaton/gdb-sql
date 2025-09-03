@@ -4,6 +4,7 @@ using System.Data;
 using System.Data.SqlTypes;
 using System.Runtime.InteropServices;
 using System.Text;
+using Spectre.Console;
 
 namespace GdbToSql;
 
@@ -37,9 +38,7 @@ public class SqlWriter
         try
         {
             using var connection = new SqlConnection(_connectionString);
-            Console.WriteLine($"[SQL] Opening connection for table creation...");
             await connection.OpenAsync();
-            Console.WriteLine($"[SQL] Connection opened successfully");
             
             // First check if table exists
             var checkCmd = new SqlCommand(
@@ -47,30 +46,24 @@ public class SqlWriter
                 connection);
             checkCmd.Parameters.AddWithValue("@tableName", tableName);
             
-            Console.WriteLine($"[SQL] Checking if table '{tableName}' exists...");
             var tableExists = ((int?)await checkCmd.ExecuteScalarAsync() ?? 0) > 0;
-            Console.WriteLine($"[SQL] Table exists check result: {tableExists}");
             
             if (tableExists)
             {
-                Console.WriteLine($"[SQL] Dropping existing table '{tableName}' to ensure clean data...");
+                AnsiConsole.MarkupLine($"[yellow]⚠ Dropping existing table [bold]{tableName}[/] for clean data...[/]");
                 var dropCmd = new SqlCommand($"DROP TABLE [{tableName}]", connection);
                 await dropCmd.ExecuteNonQueryAsync();
-                Console.WriteLine($"[SQL] Table '{tableName}' dropped successfully");
             }
             
-            Console.WriteLine($"[SQL] Generating CREATE TABLE SQL for '{tableName}'...");
             var createTableSql = GenerateCreateTableSql(tableName, sampleData);
-            Console.WriteLine($"[SQL] CREATE TABLE SQL: {createTableSql}");
             
             var createCmd = new SqlCommand(createTableSql, connection);
             await createCmd.ExecuteNonQueryAsync();
-            Console.WriteLine($"[SQL] Table '{tableName}' created successfully");
+            AnsiConsole.MarkupLine($"[green]✓ Created table [bold]{tableName}[/][/]");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[SQL ERROR] Failed to create table '{tableName}': {ex.Message}");
-            Console.WriteLine($"[SQL ERROR] Stack trace: {ex.StackTrace}");
+            AnsiConsole.MarkupLine($"[bold red]✗ Failed to create table [bold]{tableName}[/]: {ex.Message.EscapeMarkup()}[/]");
             throw;
         }
     }
@@ -81,16 +74,12 @@ public class SqlWriter
         {
             lock (ConsoleWriteLock)
             {
-                Console.WriteLine($"[SQL] Processing batch for '{batch.LayerName}' - Features: {batch.Features.Count}, FirstBatch: {batch.IsFirstBatch}, LastBatch: {batch.IsLastBatch}");
+                // Processing batch silently for cleaner output
             }
             
             if (batch.Features.Count == 0 && !batch.IsLastBatch)
             {
-                lock (ConsoleWriteLock)
-                {
-                    Console.WriteLine($"[SQL] Skipping empty batch for '{batch.LayerName}'");
-                }
-                return;
+                return; // Skip empty batch silently
             }
                 
             // Test database connection first
@@ -99,44 +88,28 @@ public class SqlWriter
             // Create table on first batch
             if (batch.IsFirstBatch && batch.Features.Count > 0)
             {
-                lock (ConsoleWriteLock)
-                {
-                    Console.WriteLine($"[SQL] Creating table '{batch.TableName}' for first batch");
-                }
+                // Create table for first batch
                 await CreateTableIfNotExistsAsync(batch.TableName, batch.Features);
             }
             
             // Insert data if there are features
             if (batch.Features.Count > 0)
             {
-                lock (ConsoleWriteLock)
-                {
-                    Console.WriteLine($"[SQL] Inserting {batch.Features.Count} features into '{batch.TableName}'");
-                }
+                // Insert features silently
                 await BulkInsertStreamingAsync(batch.TableName, batch.Features);
                 
-                lock (ConsoleWriteLock)
-                {
-                    Console.WriteLine($"[SQL] Successfully inserted {batch.Features.Count} features into '{batch.TableName}'");
-                }
+                // Batch inserted successfully
             }
             
             // Log completion on last batch
             if (batch.IsLastBatch)
             {
-                lock (ConsoleWriteLock)
-                {
-                    Console.WriteLine($"[SQL] Consumer completed layer '{batch.LayerName}' -> table '{batch.TableName}'");
-                }
+                // Layer processing completed
             }
         }
         catch (Exception ex)
         {
-            lock (ConsoleWriteLock)
-            {
-                Console.WriteLine($"[SQL ERROR] Failed to process batch for '{batch.LayerName}': {ex.Message}");
-                Console.WriteLine($"[SQL ERROR] Stack trace: {ex.StackTrace}");
-            }
+            AnsiConsole.MarkupLine($"[red]✗ Batch failed for [bold]{batch.LayerName}[/]: {ex.Message.EscapeMarkup()}[/]");
             throw;
         }
     }
@@ -149,15 +122,12 @@ public class SqlWriter
             await connection.OpenAsync();
             lock (ConsoleWriteLock)
             {
-                Console.WriteLine($"[SQL] Database connection test successful");
+                // Connection test successful (logged elsewhere)
             }
         }
         catch (Exception ex)
         {
-            lock (ConsoleWriteLock)
-            {
-                Console.WriteLine($"[SQL ERROR] Database connection failed: {ex.Message}");
-            }
+            AnsiConsole.MarkupLine($"[red]✗ Database connection failed: {ex.Message.EscapeMarkup()}[/]");
             throw;
         }
     }
@@ -168,7 +138,7 @@ public class SqlWriter
     {
         try
         {
-            Console.WriteLine($"[SQL] Starting bulk insert of {data.Count} records to '{tableName}'");
+            // Starting bulk insert silently
             
             using var connection = new SqlConnection(_connectionString);
             await connection.OpenAsync();
@@ -177,7 +147,7 @@ public class SqlWriter
             var dataTable = new DataTable();
             var firstRow = data.First();
             
-            Console.WriteLine($"[SQL] Creating DataTable with {firstRow.Keys.Count} columns");
+            // Creating DataTable silently
             
             // Add columns with proper data types
             foreach (var kvp in firstRow)
@@ -201,7 +171,7 @@ public class SqlWriter
                 }
             }
             
-            Console.WriteLine($"[SQL] Adding {data.Count} rows to DataTable");
+            // Adding rows to DataTable silently
             
             // Add rows with type conversion
             foreach (var row in data)
@@ -226,7 +196,7 @@ public class SqlWriter
                 dataTable.Rows.Add(dataRow);
             }
             
-            Console.WriteLine($"[SQL] Performing bulk copy to '{tableName}'");
+            // Performing bulk copy silently
             
             // Perform bulk copy with optimizations
             using var bulkCopy = new SqlBulkCopy(connection);
@@ -238,12 +208,11 @@ public class SqlWriter
             
             await bulkCopy.WriteToServerAsync(dataTable);
             
-            Console.WriteLine($"[SQL] Bulk copy completed successfully for '{tableName}'");
+            // Bulk copy completed silently
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"[SQL ERROR] Bulk insert failed for '{tableName}': {ex.Message}");
-            Console.WriteLine($"[SQL ERROR] Stack trace: {ex.StackTrace}");
+            AnsiConsole.MarkupLine($"[red]✗ Bulk insert failed for [bold]{tableName}[/]: {ex.Message.EscapeMarkup()}[/]");
             throw;
         }
     }
@@ -533,8 +502,9 @@ public class SqlWriter
         if (columnName == "FID")
             return "BIGINT";
             
-        if (columnName.ToUpper() == "OBJECTID")
-            return "INT";
+        // OBJECTID disabled - too many GDB files have empty/null OBJECTID values
+        // if (columnName.ToUpper() == "OBJECTID")
+        //     return "INT";
             
         var nonNullValues = allValues.Where(v => v != null && !(v is string s && string.IsNullOrWhiteSpace(s))).ToList();
         
@@ -584,7 +554,11 @@ public class SqlWriter
         }
         */
         
-        // Integer detection - be conservative
+        // Integer detection - temporarily disabled to prevent conversion errors
+        // Real-world GIS data has too many mixed integer representations and empty values
+        // Store all integer-like columns as NVARCHAR for maximum compatibility
+        // TODO: Re-enable with more sophisticated integer validation in future version
+        /*
         if ((columnName.ToLower().EndsWith("id") || columnName.ToLower() == "objectid") && allStrings.Any())
         {
             var validInts = allStrings.Where(s => !string.IsNullOrWhiteSpace(s) && int.TryParse(s, out _)).ToList();
@@ -593,6 +567,7 @@ public class SqlWriter
             if (validInts.Count > nonEmptyCount * 0.95 && nonEmptyCount > allStrings.Count * 0.5)
                 return "INT";
         }
+        */
         
         // For string columns, find the maximum length and use appropriate NVARCHAR size
         var maxLength = 0;
