@@ -196,31 +196,47 @@ public class GdbReader
                             // Ensure anti-clockwise orientation for polygons
                             var correctedGeometry = EnsureAntiClockwiseOrientation(geometry);
                             
-                            string wkt;
-                            correctedGeometry.ExportToWkt(out wkt);
-                            
-                            if (IsWindows)
+                            if (correctedGeometry == null)
                             {
-                                int srid = 4283;
-                                var sqlGeog = SqlGeography.STGeomFromText(new SqlChars(wkt), srid);
-                                
-                                if (!sqlGeog.STIsValid().Value)
+                                // Handle null geometry case
+                                if (!IsWindows)
                                 {
-                                    sqlGeog = sqlGeog.MakeValid();
+                                    featureData["WKT_GEOMETRY"] = null;
+                                    featureData["SRID"] = 4283;
                                 }
-                                
-                                featureData["GEOMETRY"] = sqlGeog;
+                                else
+                                {
+                                    featureData["GEOMETRY"] = null;
+                                }
                             }
                             else
                             {
-                                featureData["WKT_GEOMETRY"] = wkt;
-                                featureData["SRID"] = 4283;
-                            }
-                            
-                            // Dispose the corrected geometry if it's different from original
-                            if (correctedGeometry != geometry)
-                            {
-                                correctedGeometry.Dispose();
+                                string wkt;
+                                correctedGeometry.ExportToWkt(out wkt);
+                                
+                                if (IsWindows)
+                                {
+                                    int srid = 4283;
+                                    var sqlGeog = SqlGeography.STGeomFromText(new SqlChars(wkt), srid);
+                                    
+                                    if (!sqlGeog.STIsValid().Value)
+                                    {
+                                        sqlGeog = sqlGeog.MakeValid();
+                                    }
+                                    
+                                    featureData["GEOMETRY"] = sqlGeog;
+                                }
+                                else
+                                {
+                                    featureData["WKT_GEOMETRY"] = wkt;
+                                    featureData["SRID"] = 4283;
+                                }
+                                
+                                // Dispose the corrected geometry if it's different from original
+                                if (correctedGeometry != geometry)
+                                {
+                                    correctedGeometry.Dispose();
+                                }
                             }
                         }
                         catch (Exception ex)
@@ -383,8 +399,23 @@ public class GdbReader
                         // Ensure anti-clockwise orientation for polygons
                         var correctedGeometry = EnsureAntiClockwiseOrientation(geometry);
                         
-                        string wkt;
-                        correctedGeometry.ExportToWkt(out wkt);
+                        if (correctedGeometry == null)
+                        {
+                            // Handle null geometry case
+                            if (!IsWindows)
+                            {
+                                featureData["WKT_GEOMETRY"] = null;
+                                featureData["SRID"] = 4283;
+                            }
+                            else
+                            {
+                                featureData["GEOMETRY"] = null;
+                            }
+                        }
+                        else
+                        {
+                            string wkt;
+                            correctedGeometry.ExportToWkt(out wkt);
                         
                         if (IsWindows)
                         {
@@ -410,10 +441,11 @@ public class GdbReader
                             featureData["SRID"] = 4283;
                         }
                         
-                        // Dispose the corrected geometry if it's different from original
-                        if (correctedGeometry != geometry)
-                        {
-                            correctedGeometry.Dispose();
+                            // Dispose the corrected geometry if it's different from original
+                            if (correctedGeometry != geometry)
+                            {
+                                correctedGeometry.Dispose();
+                            }
                         }
                     }
                     catch (Exception ex)
@@ -442,7 +474,7 @@ public class GdbReader
         });
     }
     
-    private static Geometry EnsureAntiClockwiseOrientation(Geometry geometry)
+    private static Geometry? EnsureAntiClockwiseOrientation(Geometry? geometry)
     {
         if (geometry == null)
             return geometry;

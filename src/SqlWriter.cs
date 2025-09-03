@@ -60,7 +60,7 @@ public class SqlWriter
             }
             
             Console.WriteLine($"[SQL] Generating CREATE TABLE SQL for '{tableName}'...");
-            var createTableSql = GenerateCreateTableSql(tableName, sampleData.First());
+            var createTableSql = GenerateCreateTableSql(tableName, sampleData);
             Console.WriteLine($"[SQL] CREATE TABLE SQL: {createTableSql}");
             
             var createCmd = new SqlCommand(createTableSql, connection);
@@ -330,15 +330,18 @@ public class SqlWriter
         }
     }
     
-    private string GenerateCreateTableSql(string tableName, Dictionary<string, object?> sampleRow)
+    private string GenerateCreateTableSql(string tableName, List<Dictionary<string, object?>> allSampleData)
     {
         var sb = new StringBuilder();
         sb.AppendLine($"CREATE TABLE [{tableName}] (");
         
         var columns = new List<string>();
-        foreach (var kvp in sampleRow)
+        var firstRow = allSampleData.First();
+        
+        foreach (var kvp in firstRow)
         {
-            var sqlType = GetSqlColumnType(kvp.Key, kvp.Value);
+            // Analyze all sample data for this column to determine optimal type
+            var sqlType = GetOptimalSqlColumnType(kvp.Key, allSampleData.Select(row => row.GetValueOrDefault(kvp.Key)));
             columns.Add($"[{kvp.Key}] {sqlType}");
         }
         
@@ -394,32 +397,8 @@ public class SqlWriter
             sampleValue is string idStr && !string.IsNullOrWhiteSpace(idStr) && int.TryParse(idStr, out _))
             return "INT";
             
-        // Handle date columns by name pattern - be very conservative
-        if (columnName.ToLower().Contains("date") || columnName.ToLower().Contains("time"))
-        {
-            // Try to parse as DateTime to determine if it's a real date
-            if (sampleValue is string dateStr && !string.IsNullOrWhiteSpace(dateStr) && 
-                DateTime.TryParse(dateStr, out DateTime parsedDate) && parsedDate != DateTime.MinValue)
-            {
-                // Additional validation - must look like a reasonable date
-                if (parsedDate.Year > 1900 && parsedDate.Year < 2100)
-                    return "DATETIME2";
-            }
-        }
-        
-        // Handle boolean columns by name pattern - be very conservative
-        if (columnName.ToLower().StartsWith("is") || columnName.ToLower().StartsWith("has") || 
-            columnName.ToLower() == "iscurrent")
-        {
-            if (sampleValue is string boolStr && !string.IsNullOrWhiteSpace(boolStr))
-            {
-                var lower = boolStr.ToLower();
-                if (lower is "true" or "false" or "1" or "0" or "yes" or "no" or "y" or "n" or "t" or "f")
-                    return "BIT";
-            }
-            else if (sampleValue is bool)
-                return "BIT";
-        }
+        // Date and boolean detection temporarily disabled for maximum compatibility
+        // All date/boolean columns will be stored as NVARCHAR to prevent conversion errors
             
         if (sampleValue == null)
             return "NVARCHAR(255)";
@@ -454,30 +433,8 @@ public class SqlWriter
         if (columnName == "FID")
             return typeof(long);
             
-        // Handle date columns - be very conservative
-        if (columnName.ToLower().Contains("date") || columnName.ToLower().Contains("time"))
-        {
-            if (value is string dateStr && !string.IsNullOrWhiteSpace(dateStr) && 
-                DateTime.TryParse(dateStr, out DateTime parsedDate) && parsedDate != DateTime.MinValue)
-            {
-                // Additional validation - must look like a reasonable date
-                if (parsedDate.Year > 1900 && parsedDate.Year < 2100)
-                    return typeof(DateTime);
-            }
-        }
-        
-        // Handle boolean columns - be very conservative
-        if (columnName.ToLower().StartsWith("is") || columnName.ToLower().StartsWith("has") || 
-            columnName.ToLower() == "iscurrent")
-        {
-            if (value is string boolStr && !string.IsNullOrWhiteSpace(boolStr))
-            {
-                // Only treat as boolean if it's a clear boolean value
-                var lower = boolStr.ToLower();
-                if (lower is "true" or "false" or "1" or "0" or "yes" or "no" or "y" or "n" or "t" or "f")
-                    return typeof(bool);
-            }
-        }
+        // Date and boolean detection temporarily disabled for maximum compatibility
+        // All date/boolean columns will be stored as NVARCHAR to prevent conversion errors
         
         return value switch
         {
@@ -489,13 +446,7 @@ public class SqlWriter
             DateTime _ => typeof(DateTime),
             bool _ => typeof(bool),
             SqlGeography _ => typeof(SqlGeography),
-            string str when !string.IsNullOrWhiteSpace(str) && 
-                           (columnName.ToLower().Contains("date") || columnName.ToLower().Contains("time")) &&
-                           DateTime.TryParse(str, out DateTime parsedDate) && parsedDate != DateTime.MinValue &&
-                           parsedDate.Year > 1900 && parsedDate.Year < 2100 => typeof(DateTime),
-            string str when !string.IsNullOrWhiteSpace(str) && 
-                           (columnName.ToLower().StartsWith("is") || columnName.ToLower().StartsWith("has")) &&
-                           str.ToLower() is "true" or "false" or "1" or "0" or "yes" or "no" or "y" or "n" or "t" or "f" => typeof(bool),
+            // Date and boolean detection removed for compatibility
             // Be more conservative with integer detection - only for columns clearly meant to be integers
             string str when !string.IsNullOrWhiteSpace(str) && int.TryParse(str, out _) && 
                            (columnName.ToLower().EndsWith("id") || columnName.ToLower() == "objectid") => typeof(int),
@@ -565,5 +516,105 @@ public class SqlWriter
         
         // If no conversion needed or possible, return original value
         return value;
+    }
+    
+    private string GetOptimalSqlColumnType(string columnName, IEnumerable<object?> allValues)
+    {
+        // Handle special geometry columns
+        if (columnName == "GEOMETRY" && IsWindows)
+            return "GEOGRAPHY";
+            
+        if (columnName == "WKT_GEOMETRY" && !IsWindows)
+            return "NVARCHAR(MAX)";
+            
+        if (columnName == "SRID" && !IsWindows)
+            return "INT";
+            
+        if (columnName == "FID")
+            return "BIGINT";
+            
+        if (columnName.ToUpper() == "OBJECTID")
+            return "INT";
+            
+        var nonNullValues = allValues.Where(v => v != null && !(v is string s && string.IsNullOrWhiteSpace(s))).ToList();
+        
+        if (!nonNullValues.Any())
+            return "NVARCHAR(255)";
+            
+        // Check if all values can be parsed as specific types
+        var allStrings = nonNullValues.OfType<string>().ToList();
+        
+        // Date detection - temporarily disabled to prevent conversion errors
+        // Real-world GIS data has too many mixed date formats and empty values
+        // Store all date-like columns as NVARCHAR for maximum compatibility
+        // TODO: Re-enable with more sophisticated date validation in future version
+        /*
+        if ((columnName.ToLower().Contains("date") || columnName.ToLower().Contains("time")) && allStrings.Any())
+        {
+            var validDates = allStrings.Where(s => !string.IsNullOrWhiteSpace(s) && 
+                                                  DateTime.TryParse(s, out DateTime date) && 
+                                                  date != DateTime.MinValue && 
+                                                  date.Year > 1900 && date.Year < 2100).ToList();
+            
+            // Only treat as datetime if 95% of non-empty values are valid dates AND at least 50% of all values are non-empty
+            var nonEmptyCount = allStrings.Where(s => !string.IsNullOrWhiteSpace(s)).Count();
+            if (validDates.Count > nonEmptyCount * 0.95 && nonEmptyCount > allStrings.Count * 0.5)
+                return "DATETIME2";
+        }
+        */
+        
+        // Boolean detection - temporarily disabled to prevent conversion errors
+        // Real-world GIS data has too many mixed boolean representations and empty values
+        // Store all boolean-like columns as NVARCHAR for maximum compatibility
+        // TODO: Re-enable with more sophisticated boolean validation in future version
+        /*
+        if ((columnName.ToLower().StartsWith("is") || columnName.ToLower().StartsWith("has") || 
+            columnName.ToLower() == "iscurrent") && allStrings.Any())
+        {
+            var validBooleans = allStrings.Where(s => 
+            {
+                if (string.IsNullOrWhiteSpace(s)) return false;
+                var lower = s.ToLower();
+                return lower is "true" or "false" or "1" or "0" or "yes" or "no" or "y" or "n" or "t" or "f";
+            }).ToList();
+            
+            var nonEmptyCount = allStrings.Where(s => !string.IsNullOrWhiteSpace(s)).Count();
+            if (validBooleans.Count > nonEmptyCount * 0.95 && nonEmptyCount > allStrings.Count * 0.5)
+                return "BIT";
+        }
+        */
+        
+        // Integer detection - be conservative
+        if ((columnName.ToLower().EndsWith("id") || columnName.ToLower() == "objectid") && allStrings.Any())
+        {
+            var validInts = allStrings.Where(s => !string.IsNullOrWhiteSpace(s) && int.TryParse(s, out _)).ToList();
+            
+            var nonEmptyCount = allStrings.Where(s => !string.IsNullOrWhiteSpace(s)).Count();
+            if (validInts.Count > nonEmptyCount * 0.95 && nonEmptyCount > allStrings.Count * 0.5)
+                return "INT";
+        }
+        
+        // For string columns, find the maximum length and use appropriate NVARCHAR size
+        var maxLength = 0;
+        foreach (var value in allValues)
+        {
+            if (value is string str && !string.IsNullOrEmpty(str))
+            {
+                maxLength = Math.Max(maxLength, str.Length);
+            }
+        }
+        
+        // Use appropriate NVARCHAR size with some buffer
+        return maxLength switch
+        {
+            0 => "NVARCHAR(255)",
+            <= 50 => "NVARCHAR(100)",      // 100% buffer for short strings
+            <= 100 => "NVARCHAR(200)",     // 100% buffer
+            <= 255 => "NVARCHAR(500)",     // ~100% buffer
+            <= 500 => "NVARCHAR(1000)",    // 100% buffer
+            <= 1000 => "NVARCHAR(2000)",   // 100% buffer
+            <= 2000 => "NVARCHAR(4000)",   // 100% buffer
+            _ => "NVARCHAR(MAX)"           // For very long strings
+        };
     }
 }
