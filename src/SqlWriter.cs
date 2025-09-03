@@ -14,7 +14,19 @@ public class SqlWriter
     
     public SqlWriter(string connectionString)
     {
+        // For now, use the original connection string to avoid credential issues
+        // TODO: Re-enable connection string optimization once credentials are working
         _connectionString = connectionString;
+        
+        // Optimize connection string for performance (disabled temporarily)
+        // var builder = new SqlConnectionStringBuilder(connectionString)
+        // {
+        //     Pooling = true,
+        //     MinPoolSize = 5,
+        //     MaxPoolSize = 100,
+        //     ConnectTimeout = 30
+        // };
+        // _connectionString = builder.ConnectionString;
     }
     
     public async Task CreateTableIfNotExistsAsync(string tableName, List<Dictionary<string, object?>> sampleData)
@@ -210,10 +222,13 @@ public class SqlWriter
             
             Console.WriteLine($"[SQL] Performing bulk copy to '{tableName}'");
             
-            // Perform bulk copy
+            // Perform bulk copy with optimizations
             using var bulkCopy = new SqlBulkCopy(connection);
             bulkCopy.DestinationTableName = tableName;
             bulkCopy.BulkCopyTimeout = 300;
+            bulkCopy.BatchSize = Math.Min(data.Count, 10000);
+            bulkCopy.EnableStreaming = true;
+            bulkCopy.NotifyAfter = Math.Min(data.Count / 4, 2500);
             
             await bulkCopy.WriteToServerAsync(dataTable);
             

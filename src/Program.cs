@@ -5,6 +5,9 @@ using System.Threading.Channels;
 
 try
 {
+    var totalTimer = System.Diagnostics.Stopwatch.StartNew();
+    var timings = new Dictionary<string, TimeSpan>();
+    
     Console.WriteLine("GDB to SQL Converter");
     Console.WriteLine("====================");
     
@@ -15,12 +18,15 @@ try
     Console.WriteLine();
     
     // Load configuration
+    var configTimer = System.Diagnostics.Stopwatch.StartNew();
     var configuration = new ConfigurationBuilder()
         .SetBasePath(Directory.GetCurrentDirectory())
         .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
         .Build();
     
     var settings = configuration.Get<AppSettings>();
+    configTimer.Stop();
+    timings["Configuration Load"] = configTimer.Elapsed;
     
     if (settings == null)
     {
@@ -38,8 +44,11 @@ try
     Console.WriteLine();
     
     // Test database connection first
+    var dbTestTimer = System.Diagnostics.Stopwatch.StartNew();
     Console.WriteLine("Testing database connection...");
     var connectionValid = await ConnectionTester.TestDatabaseConnectionAsync(settings.ConnectionStrings.DefaultConnection);
+    dbTestTimer.Stop();
+    timings["Database Connection Test"] = dbTestTimer.Elapsed;
     
     if (!connectionValid)
     {
@@ -50,8 +59,11 @@ try
     Console.WriteLine("Database connection successful. Continuing with processing...\n");
     
     // Get layer information
+    var layerInfoTimer = System.Diagnostics.Stopwatch.StartNew();
     Console.WriteLine("Getting layer information from GDB...");
     var layerInfos = GdbReader.GetLayerInfos(settings.GdbToSql.SourceGdbPath);
+    layerInfoTimer.Stop();
+    timings["Layer Information Scan"] = layerInfoTimer.Elapsed;
     Console.WriteLine($"GetLayerInfos returned {layerInfos.Count} layers");
     
     if (layerInfos.Count == 0)
@@ -153,6 +165,15 @@ try
     
     Console.WriteLine($"Starting {producerCount} producer threads for {layerInfos.Count} layers...");
     
+    // Calculate optimal batch size based on layer characteristics
+    var optimalBatchSize = CalculateOptimalBatchSize(layerInfos);
+    Console.WriteLine($"Using dynamic batch size: {optimalBatchSize} features per batch");
+    
+    // Monitor memory usage
+    GC.Collect();
+    var initialMemory = GC.GetTotalMemory(false) / (1024 * 1024);
+    Console.WriteLine($"Initial memory usage: {initialMemory} MB");
+    
     var producers = layerInfos.Select(async layerInfo =>
     {
         await semaphore.WaitAsync();
@@ -160,7 +181,7 @@ try
         {
             Console.WriteLine($"[Producer] Starting layer '{layerInfo.LayerName}' with {layerInfo.TotalFeatures} features");
             await GdbReader.ProduceLayerBatchesAsync(settings.GdbToSql.SourceGdbPath, 
-                layerInfo, channel.Writer, progress, batchSize: 5000);
+                layerInfo, channel.Writer, progress, batchSize: optimalBatchSize);
             Console.WriteLine($"[Producer] Completed layer '{layerInfo.LayerName}'");
         }
         catch (Exception ex)
@@ -174,8 +195,11 @@ try
         }
     });
     
+    var processingTimer = System.Diagnostics.Stopwatch.StartNew();
     Console.WriteLine("Waiting for all producers to complete...");
     await Task.WhenAll(producers);
+    var producerTime = processingTimer.Elapsed;
+    timings["Producer Processing"] = producerTime;
     
     Console.WriteLine("All producers completed. Signaling completion to consumers...");
     // Signal completion to consumers
@@ -184,6 +208,9 @@ try
     Console.WriteLine("Waiting for all consumers to complete...");
     // Wait for all consumers to complete
     await Task.WhenAll(consumers);
+    processingTimer.Stop();
+    timings["Total Data Processing"] = processingTimer.Elapsed;
+    timings["Consumer Processing"] = processingTimer.Elapsed - producerTime;
     
     Console.WriteLine("All consumers completed. Stopping progress reporting...");
     
@@ -192,8 +219,30 @@ try
     
     // Final progress update
     progress.ShowProgress();
+    
+    // Final memory check
+    GC.Collect();
+    var finalMemory = GC.GetTotalMemory(false) / (1024 * 1024);
+    Console.WriteLine($"\nFinal memory usage: {finalMemory} MB (delta: {finalMemory - initialMemory} MB)");
+    
+    totalTimer.Stop();
+    timings["Total Application Time"] = totalTimer.Elapsed;
+    
     Console.WriteLine($"\nSuccessfully processed {layerInfos.Count} layers with {totalFeatures} total features using streaming pattern");
-    Console.WriteLine($"Used {producerCount} producer threads and {consumerCount} consumer threads");
+    Console.WriteLine($"Used {producerCount} producer threads and {consumerCount} consumer threads with batch size {optimalBatchSize}");
+    
+    // Display timing summary
+    Console.WriteLine("\n" + new string('=', 50));
+    Console.WriteLine("PERFORMANCE TIMING SUMMARY");
+    Console.WriteLine(new string('=', 50));
+    foreach (var timing in timings.OrderBy(t => t.Value))
+    {
+        Console.WriteLine($"{timing.Key,-30}: {timing.Value.TotalSeconds:F2}s");
+    }
+    Console.WriteLine(new string('=', 50));
+    Console.WriteLine($"{"Features per second",-30}: {totalFeatures / timings["Total Data Processing"].TotalSeconds:F0}");
+    Console.WriteLine($"{"MB processed per second",-30}: {finalMemory / timings["Total Data Processing"].TotalSeconds:F2}");
+    Console.WriteLine(new string('=', 50));
 }
 catch (Exception ex)
 {
@@ -203,4 +252,19 @@ catch (Exception ex)
         Console.WriteLine($"Inner error: {ex.InnerException.Message}");
     }
     Environment.Exit(1);
+}
+
+static int CalculateOptimalBatchSize(List<LayerInfo> layerInfos)
+{
+    var totalFeatures = layerInfos.Sum(l => l.TotalFeatures);
+    var avgFeaturesPerLayer = totalFeatures / layerInfos.Count;
+    
+    // Dynamic batch sizing based on data volume
+    return avgFeaturesPerLayer switch
+    {
+        < 1000 => 500,          // Small layers: smaller batches
+        < 10000 => 2000,        // Medium layers: moderate batches  
+        < 100000 => 5000,       // Large layers: larger batches
+        _ => 10000              // Very large layers: maximum batches
+    };
 }
