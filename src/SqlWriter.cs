@@ -72,10 +72,7 @@ public class SqlWriter
     {
         try
         {
-            lock (ConsoleWriteLock)
-            {
-                // Processing batch silently for cleaner output
-            }
+            // Processing batch silently for cleaner output
             
             if (batch.Features.Count == 0 && !batch.IsLastBatch)
             {
@@ -120,10 +117,7 @@ public class SqlWriter
         {
             using var connection = new SqlConnection(_connectionString);
             await connection.OpenAsync();
-            lock (ConsoleWriteLock)
-            {
-                // Connection test successful (logged elsewhere)
-            }
+            // Connection test successful (logged elsewhere)
         }
         catch (Exception ex)
         {
@@ -132,7 +126,7 @@ public class SqlWriter
         }
     }
     
-    private static readonly object ConsoleWriteLock = new();
+    // Console write lock removed - no longer needed with Spectre.Console
     
     private async Task BulkInsertStreamingAsync(string tableName, List<Dictionary<string, object?>> data)
     {

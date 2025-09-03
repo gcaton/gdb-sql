@@ -93,7 +93,7 @@ public class GdbReader
         return allLayersData;
     }
     
-    private static readonly object ConsoleWriteLock = new object();
+    // Console write lock removed - no longer needed with Spectre.Console
     
     public static List<LayerInfo> GetLayerInfos(string gdbPath)
     {
@@ -240,12 +240,9 @@ public class GdbReader
                                 }
                             }
                         }
-                        catch (Exception ex)
+                        catch (Exception)
                         {
-                            lock (ConsoleWriteLock)
-                            {
-                                Console.WriteLine($"    Warning: Failed to convert geometry for feature {feature.GetFID()} in layer {layerInfo.LayerName}: {ex.Message}");
-                            }
+                            // Geometry conversion warning (non-critical)
                             if (!IsWindows)
                             {
                                 featureData["WKT_GEOMETRY"] = null;
@@ -265,10 +262,7 @@ public class GdbReader
                     // Send batch when it reaches the batch size
                     if (batch.Count >= batchSize)
                     {
-                        lock (ConsoleWriteLock)
-                        {
-                            // Sending batch silently
-                        }
+                        // Sending batch silently
                         
                         await writer.WriteAsync(new LayerBatch
                         {
@@ -288,10 +282,7 @@ public class GdbReader
                 // Send final batch if there are remaining features
                 if (batch.Count > 0)
                 {
-                    lock (ConsoleWriteLock)
-                    {
-                        // Final batch sent
-                    }
+                    // Final batch sent
                     
                     await writer.WriteAsync(new LayerBatch
                     {
@@ -304,10 +295,7 @@ public class GdbReader
                 }
                 else if (processedCount > 0)
                 {
-                    lock (ConsoleWriteLock)
-                    {
-                        // Completion marker sent
-                    }
+                    // Completion marker sent
                     
                     // Mark the previous batch as the last batch
                     await writer.WriteAsync(new LayerBatch
@@ -322,17 +310,11 @@ public class GdbReader
                 
                 progress.UpdateProgress(layerInfo.LayerName, processedCount, layerInfo.TotalFeatures);
                 
-                lock (ConsoleWriteLock)
-                {
-                    // Producer completed layer
-                }
+                // Producer completed layer
             }
             catch (Exception ex)
             {
-                lock (ConsoleWriteLock)
-                {
-                    Console.WriteLine($"Error reading layer {layerInfo.LayerName}: {ex.Message}");
-                }
+                AnsiConsole.MarkupLine($"[red]✗ Error reading layer [bold]{layerInfo.LayerName}[/]: {ex.Message.EscapeMarkup()}[/]");
                 throw;
             }
         });
@@ -449,12 +431,9 @@ public class GdbReader
                             }
                         }
                     }
-                    catch (Exception ex)
+                    catch (Exception)
                     {
-                        lock (ConsoleWriteLock)
-                        {
-                            Console.WriteLine($"    Warning: Failed to convert geometry for feature {feature.GetFID()} in layer {layerName}: {ex.Message}");
-                        }
+                        // Geometry conversion warning (non-critical)
                         if (!IsWindows)
                         {
                             featureData["WKT_GEOMETRY"] = null;
