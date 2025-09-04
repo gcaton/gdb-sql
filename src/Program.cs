@@ -265,13 +265,8 @@ try
     
     var processingTimer = System.Diagnostics.Stopwatch.StartNew();
     
-    await AnsiConsole.Status()
-        .Spinner(Spinner.Known.Clock)
-        .SpinnerStyle(Style.Parse("yellow bold"))
-        .StartAsync("[yellow]Processing all layers...[/]", async ctx =>
-        {
-            await Task.WhenAll(producers);
-        });
+    // Process all layers silently
+    await Task.WhenAll(producers);
     
     var producerTime = processingTimer.Elapsed;
     timings["Producer Processing"] = producerTime;

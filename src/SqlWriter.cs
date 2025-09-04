@@ -49,7 +49,7 @@ public class SqlWriter
             
             if (tableExists)
             {
-                AnsiConsole.MarkupLine($"[yellow]⚠ Dropping existing table [bold]{tableName}[/] for clean data...[/]");
+                // Silently drop existing table
                 var dropCmd = new SqlCommand($"DROP TABLE [{tableName}]", connection);
                 await dropCmd.ExecuteNonQueryAsync();
             }
@@ -58,7 +58,7 @@ public class SqlWriter
             
             var createCmd = new SqlCommand(createTableSql, connection);
             await createCmd.ExecuteNonQueryAsync();
-            AnsiConsole.MarkupLine($"[green]✓ Created table [bold]{tableName}[/][/]");
+            // Table created silently
         }
         catch (Exception ex)
         {
