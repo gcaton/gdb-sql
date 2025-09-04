@@ -50,79 +50,131 @@ public static class SpatialHelpers
         return shape != null && shape.GeometryType.Equals("geometrycollection", StringComparison.OrdinalIgnoreCase);
     }
 
-    public static NetTopologySuite.Geometries.Geometry? CorrectPolygonOrientation(this NetTopologySuite.Geometries.Geometry shape)
+    public static NetTopologySuite.Geometries.Geometry? CorrectPolygonOrientation(this NetTopologySuite.Geometries.Geometry? shape)
     {
-        // We only care about non empty geometries that are or can contain polygons.
-        if (shape == null || shape.IsEmpty || (!shape.IsPolygon() && !shape.IsGeometryCollection() && !shape.IsMultiPolygon())) { return shape; }
+        // Early exit for null, empty, or non-polygon geometries
+        if (shape == null || shape.IsEmpty) 
+            return shape;
 
-        // Deal with the simple case first, if the shape is a polygon, check is orientation and reverse if nessessary.
-        if (shape.IsPolygon())
+        return shape switch
         {
-            // reverse any non ccw shells
-            var poly = (Polygon)shape;
-            if (!poly.Shell.IsCCW)
+            Polygon polygon => CorrectSinglePolygon(polygon),
+            MultiPolygon multiPolygon => CorrectMultiPolygon(multiPolygon),
+            GeometryCollection collection => CorrectGeometryCollection(collection),
+            _ => shape // Return unchanged for other geometry types
+        };
+    }
+
+    private static Polygon CorrectSinglePolygon(Polygon poly)
+    {
+        bool needsRecreation = false;
+        LinearRing? correctedShell = null;
+        LinearRing[]? correctedHoles = null;
+
+        // Check and correct shell orientation (should be CCW)
+        if (!poly.Shell.IsCCW)
+        {
+            correctedShell = (LinearRing)poly.Shell.Reverse();
+            needsRecreation = true;
+        }
+
+        // Check and correct hole orientations (should be CW)
+        if (poly.Holes.Length > 0)
+        {
+            for (int i = 0; i < poly.Holes.Length; i++)
             {
-                var lr = (LinearRing)poly.Shell.Reverse();
-                poly = Gda94GeometryFactory.CreatePolygon(lr, poly.Holes);
-
-                // Debug.Assert(!poly.Shell.IsCCW, "The shell of this poly has just been reversed, but it remains counter clockwise.");
-            }
-
-            // all holes are required to be clockwise.
-            if (poly.Holes.Length > 0)
-            {
-                var cwHoles = new List<LinearRing>();
-
-                for (var i = 0; i < poly.Holes.Length; i++)
+                if (poly.Holes[i].IsCCW)
                 {
-                    if (poly.Holes[i].IsCCW)
+                    // Lazy initialization of corrected holes array
+                    if (correctedHoles == null)
                     {
-                        var cwHole = (LinearRing)poly.Holes[i].Reverse();
-                        cwHoles.Add(cwHole);
-
+                        correctedHoles = new LinearRing[poly.Holes.Length];
+                        // Copy already processed holes
+                        for (int j = 0; j < i; j++)
+                        {
+                            correctedHoles[j] = poly.Holes[j];
+                        }
                     }
-                    else
-                    {
-                        cwHoles.Add(poly.Holes[i]);
-                    }
+                    correctedHoles[i] = (LinearRing)poly.Holes[i].Reverse();
+                    needsRecreation = true;
                 }
-
-                poly = Gda94GeometryFactory.CreatePolygon(poly.Shell, cwHoles.ToArray());
-            }
-
-            poly.SRID = GDA94_SRID;
-
-            return poly;
-        }
-
-        // If we have a multipolygon, look at all polygons within.
-        if (shape.IsMultiPolygon())
-        {
-            var multipolygon = (MultiPolygon)shape;
-            for (var i = 0; i < multipolygon.Geometries.Length; i++)
-            {
-                var poly = (Polygon)multipolygon.Geometries[i];
-                multipolygon.Geometries.SetValue(poly.CorrectPolygonOrientation(), i);
-            }
-        }
-
-        // If we have a geom collection, look at all polygons and multi-polygons within.
-        if (shape.IsGeometryCollection())
-        {
-            var geomCollection = (GeometryCollection)shape;
-
-            for (var i = 0; i < geomCollection.Geometries.Length; i++)
-            {
-                var geom = geomCollection[i];
-
-                if (geom.IsPolygon() || geom.IsMultiPolygon())
+                else if (correctedHoles != null)
                 {
-                    geomCollection.Geometries.SetValue(geom.CorrectPolygonOrientation(), i);
+                    correctedHoles[i] = poly.Holes[i];
                 }
             }
         }
 
-        return shape;
+        // Only create new polygon if changes were made
+        if (needsRecreation)
+        {
+            var newPoly = Gda94GeometryFactory.CreatePolygon(
+                correctedShell ?? poly.Shell,
+                correctedHoles ?? poly.Holes
+            );
+            newPoly.SRID = GDA94_SRID;
+            return newPoly;
+        }
+
+        // Set SRID even if no orientation changes were needed
+        poly.SRID = GDA94_SRID;
+        return poly;
+    }
+
+    private static MultiPolygon CorrectMultiPolygon(MultiPolygon multiPolygon)
+    {
+        var correctedPolygons = new Polygon[multiPolygon.NumGeometries];
+        bool anyChanged = false;
+
+        for (int i = 0; i < multiPolygon.NumGeometries; i++)
+        {
+            var originalPoly = (Polygon)multiPolygon.GetGeometryN(i);
+            var correctedPoly = CorrectSinglePolygon(originalPoly);
+            correctedPolygons[i] = correctedPoly;
+            
+            if (!ReferenceEquals(originalPoly, correctedPoly))
+            {
+                anyChanged = true;
+            }
+        }
+
+        if (anyChanged)
+        {
+            var newMultiPoly = Gda94GeometryFactory.CreateMultiPolygon(correctedPolygons);
+            newMultiPoly.SRID = GDA94_SRID;
+            return newMultiPoly;
+        }
+
+        multiPolygon.SRID = GDA94_SRID;
+        return multiPolygon;
+    }
+
+    private static GeometryCollection CorrectGeometryCollection(GeometryCollection collection)
+    {
+        var correctedGeometries = new NetTopologySuite.Geometries.Geometry[collection.NumGeometries];
+        bool anyChanged = false;
+
+        for (int i = 0; i < collection.NumGeometries; i++)
+        {
+            var geom = collection.GetGeometryN(i);
+            var correctedGeom = geom.CorrectPolygonOrientation();
+            correctedGeometries[i] = correctedGeom ?? geom;
+            
+            if (!ReferenceEquals(geom, correctedGeom))
+            {
+                anyChanged = true;
+            }
+        }
+
+        if (anyChanged)
+        {
+            var newCollection = Gda94GeometryFactory.CreateGeometryCollection(correctedGeometries);
+            newCollection.SRID = GDA94_SRID;
+            return newCollection;
+        }
+
+        collection.SRID = GDA94_SRID;
+        return collection;
     }
 }
 
