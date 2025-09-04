@@ -18,6 +18,7 @@
 mono_crash.*
 
 *.gdb/
+.idea
 
 # Build results
 [Dd]ebug/
