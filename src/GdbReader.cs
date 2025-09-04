@@ -1,18 +1,133 @@
 using MaxRev.Gdal.Core;
-using Microsoft.SqlServer.Types;
 using OSGeo.OGR;
-using OSGeo.OSR;
-using System.Data.SqlTypes;
 using System.Runtime.InteropServices;
 using System.Threading.Channels;
 using Spectre.Console;
+using NetTopologySuite.Geometries;
+using NetTopologySuite.IO;
+using NetTopologySuite.Operation.Valid;
+using NetTopologySuite;
+using NetTopologySuite.Geometries.Implementation;
 
 namespace GdbToSql;
 
+public static class SpatialHelpers
+{
+    private static int GDA94_SRID = 4283; // GDA94 SRID
+
+    // While this declaration doesn't appear to be used there seems to be a bug that means
+    // if this line isn't here it can cause problems.
+    // https://github.com/NetTopologySuite/NetTopologySuite/issues/573
+    private static readonly GeometryFactory DefaultFactory = GeometryFactory.Default;
+
+    public static readonly PrecisionModel DefaultPrecisionModel = new();
+    public static readonly CoordinateSequenceFactory XYCoordinateSequenceFactory = new DotSpatialAffineCoordinateSequenceFactory(Ordinates.XY);
+    public static readonly NtsGeometryServices Gda94GeometryService = new(XYCoordinateSequenceFactory, DefaultPrecisionModel, GDA94_SRID);
+    public static readonly GeometryFactory Gda94GeometryFactory = new GeometryFactoryEx(DefaultPrecisionModel, GDA94_SRID, XYCoordinateSequenceFactory, Gda94GeometryService)
+    {
+        OrientationOfExteriorRing = LinearRingOrientation.CCW
+    };
+
+    public static readonly SqlServerBytesWriter SqlServerBytesWriter = new ()
+    {
+        HandleOrdinates = Ordinates.XY,
+        IsGeography = true
+    };
+
+
+    public static bool IsPolygon(this NetTopologySuite.Geometries.Geometry shape)
+    {
+        return shape != null && shape.GeometryType.Equals("polygon", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsMultiPolygon(this NetTopologySuite.Geometries.Geometry shape)
+    {
+        return shape != null && shape.GeometryType.Equals("multipolygon", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsGeometryCollection(this NetTopologySuite.Geometries.Geometry shape)
+    {
+        return shape != null && shape.GeometryType.Equals("geometrycollection", StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static NetTopologySuite.Geometries.Geometry? CorrectPolygonOrientation(this NetTopologySuite.Geometries.Geometry shape)
+    {
+        // We only care about non empty geometries that are or can contain polygons.
+        if (shape == null || shape.IsEmpty || (!shape.IsPolygon() && !shape.IsGeometryCollection() && !shape.IsMultiPolygon())) { return shape; }
+
+        // Deal with the simple case first, if the shape is a polygon, check is orientation and reverse if nessessary.
+        if (shape.IsPolygon())
+        {
+            // reverse any non ccw shells
+            var poly = (Polygon)shape;
+            if (!poly.Shell.IsCCW)
+            {
+                var lr = (LinearRing)poly.Shell.Reverse();
+                poly = Gda94GeometryFactory.CreatePolygon(lr, poly.Holes);
+
+                // Debug.Assert(!poly.Shell.IsCCW, "The shell of this poly has just been reversed, but it remains counter clockwise.");
+            }
+
+            // all holes are required to be clockwise.
+            if (poly.Holes.Length > 0)
+            {
+                var cwHoles = new List<LinearRing>();
+
+                for (var i = 0; i < poly.Holes.Length; i++)
+                {
+                    if (poly.Holes[i].IsCCW)
+                    {
+                        var cwHole = (LinearRing)poly.Holes[i].Reverse();
+                        cwHoles.Add(cwHole);
+
+                    }
+                    else
+                    {
+                        cwHoles.Add(poly.Holes[i]);
+                    }
+                }
+
+                poly = Gda94GeometryFactory.CreatePolygon(poly.Shell, cwHoles.ToArray());
+            }
+
+            poly.SRID = GDA94_SRID;
+
+            return poly;
+        }
+
+        // If we have a multipolygon, look at all polygons within.
+        if (shape.IsMultiPolygon())
+        {
+            var multipolygon = (MultiPolygon)shape;
+            for (var i = 0; i < multipolygon.Geometries.Length; i++)
+            {
+                var poly = (Polygon)multipolygon.Geometries[i];
+                multipolygon.Geometries.SetValue(poly.CorrectPolygonOrientation(), i);
+            }
+        }
+
+        // If we have a geom collection, look at all polygons and multi-polygons within.
+        if (shape.IsGeometryCollection())
+        {
+            var geomCollection = (GeometryCollection)shape;
+
+            for (var i = 0; i < geomCollection.Geometries.Length; i++)
+            {
+                var geom = geomCollection[i];
+
+                if (geom.IsPolygon() || geom.IsMultiPolygon())
+                {
+                    geomCollection.Geometries.SetValue(geom.CorrectPolygonOrientation(), i);
+                }
+            }
+        }
+
+        return shape;
+    }
+}
+
 public class GdbReader
 {
-    private static readonly bool IsWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
-    
     static GdbReader()
     {
         GdalBase.ConfigureAll();
@@ -92,8 +207,6 @@ public class GdbReader
         
         return allLayersData;
     }
-    
-    // Console write lock removed - no longer needed with Spectre.Console
     
     public static List<LayerInfo> GetLayerInfos(string gdbPath)
     {
@@ -192,66 +305,20 @@ public class GdbReader
                     var geometry = feature.GetGeometryRef();
                     if (geometry != null)
                     {
-                        try
+                        int srid = 4283;
+                        geometry.ExportToWkt(out var wkt);
+                        if (wkt == null)
                         {
-                            // Ensure anti-clockwise orientation for polygons
-                            var correctedGeometry = EnsureAntiClockwiseOrientation(geometry);
-                            
-                            if (correctedGeometry == null)
-                            {
-                                // Handle null geometry case
-                                if (!IsWindows)
-                                {
-                                    featureData["WKT_GEOMETRY"] = null;
-                                    featureData["SRID"] = 4283;
-                                }
-                                else
-                                {
-                                    featureData["GEOMETRY"] = null;
-                                }
-                            }
-                            else
-                            {
-                                string wkt;
-                                correctedGeometry.ExportToWkt(out wkt);
-                                
-                                if (IsWindows)
-                                {
-                                    int srid = 4283;
-                                    var sqlGeog = SqlGeography.STGeomFromText(new SqlChars(wkt), srid);
-                                    
-                                    if (!sqlGeog.STIsValid().Value)
-                                    {
-                                        sqlGeog = sqlGeog.MakeValid();
-                                    }
-                                    
-                                    featureData["GEOMETRY"] = sqlGeog;
-                                }
-                                else
-                                {
-                                    featureData["WKT_GEOMETRY"] = wkt;
-                                    featureData["SRID"] = 4283;
-                                }
-                                
-                                // Dispose the corrected geometry if it's different from original
-                                if (correctedGeometry != geometry)
-                                {
-                                    correctedGeometry.Dispose();
-                                }
-                            }
+                            featureData["SHAPE"] = null;
                         }
-                        catch (Exception)
+                        else
                         {
-                            // Geometry conversion warning (non-critical)
-                            if (!IsWindows)
-                            {
-                                featureData["WKT_GEOMETRY"] = null;
-                                featureData["SRID"] = 4283;
-                            }
-                            else
-                            {
-                                featureData["GEOMETRY"] = null;
-                            }
+                            var ntsReader = new WKTReader(SpatialHelpers.Gda94GeometryService);
+                            var ntsGeometry = ntsReader.Read(wkt);
+                            ntsGeometry.SRID = srid;
+                            ntsGeometry = ntsGeometry.CorrectPolygonOrientation();
+                            featureData["SHAPE"] = SpatialHelpers.SqlServerBytesWriter.Write(ntsGeometry);
+                            //featureData["SHAPE"] = ntsGeometry;
                         }
                     }
                     
@@ -377,72 +444,19 @@ public class GdbReader
                 var geometry = feature.GetGeometryRef();
                 if (geometry != null)
                 {
-                    try
+                    int srid = 4283;
+                    geometry.ExportToWkt(out var wkt);
+                    if (wkt == null)
                     {
-                        // Ensure anti-clockwise orientation for polygons
-                        var correctedGeometry = EnsureAntiClockwiseOrientation(geometry);
-                        
-                        if (correctedGeometry == null)
-                        {
-                            // Handle null geometry case
-                            if (!IsWindows)
-                            {
-                                featureData["WKT_GEOMETRY"] = null;
-                                featureData["SRID"] = 4283;
-                            }
-                            else
-                            {
-                                featureData["GEOMETRY"] = null;
-                            }
-                        }
-                        else
-                        {
-                            string wkt;
-                            correctedGeometry.ExportToWkt(out wkt);
-                        
-                        if (IsWindows)
-                        {
-                            // Use SQL Geography on Windows
-                            // Use SRID 4283 (GDA94) for Australian data
-                            int srid = 4283;
-                            
-                            // Create SqlGeography from WKT
-                            var sqlGeog = SqlGeography.STGeomFromText(new SqlChars(wkt), srid);
-                            
-                            // Ensure valid geography
-                            if (!sqlGeog.STIsValid().Value)
-                            {
-                                sqlGeog = sqlGeog.MakeValid();
-                            }
-                            
-                            featureData["GEOMETRY"] = sqlGeog;
-                        }
-                        else
-                        {
-                            // Use WKT on Linux
-                            featureData["WKT_GEOMETRY"] = wkt;
-                            featureData["SRID"] = 4283;
-                        }
-                        
-                            // Dispose the corrected geometry if it's different from original
-                            if (correctedGeometry != geometry)
-                            {
-                                correctedGeometry.Dispose();
-                            }
-                        }
+                        featureData["SHAPE"] = null;
                     }
-                    catch (Exception)
+                    else
                     {
-                        // Geometry conversion warning (non-critical)
-                        if (!IsWindows)
-                        {
-                            featureData["WKT_GEOMETRY"] = null;
-                            featureData["SRID"] = 4283;
-                        }
-                        else
-                        {
-                            featureData["GEOMETRY"] = null;
-                        }
+                        var ntsReader = new WKTReader(SpatialHelpers.Gda94GeometryService);
+                        var ntsGeometry = ntsReader.Read(wkt);
+                        ntsGeometry.SRID = srid;
+                        ntsGeometry = ntsGeometry.CorrectPolygonOrientation();
+                        featureData["SHAPE"] = SpatialHelpers.SqlServerBytesWriter.Write(ntsGeometry);
                     }
                 }
                 
@@ -453,189 +467,192 @@ public class GdbReader
             return features;
         });
     }
+
+
     
-    private static Geometry? EnsureAntiClockwiseOrientation(Geometry? geometry)
-    {
-        if (geometry == null)
-            return geometry;
-            
-        var geometryType = geometry.GetGeometryType();
-        
-        switch (geometryType)
-        {
-            case wkbGeometryType.wkbPolygon:
-                return CorrectPolygonOrientation(geometry);
-                
-            case wkbGeometryType.wkbMultiPolygon:
-                return CorrectMultiPolygonOrientation(geometry);
-                
-            default:
-                // For non-polygon geometries, return as-is
-                return geometry;
-        }
-    }
-    
-    private static Geometry CorrectPolygonOrientation(Geometry polygon)
-    {
-        try
-        {
-            // Get the exterior ring
-            var exteriorRing = polygon.GetGeometryRef(0);
-            if (exteriorRing == null)
-                return polygon;
-                
-            // Check if exterior ring is clockwise (should be anti-clockwise)
-            if (IsClockwise(exteriorRing))
-            {
-                // Create a new polygon with corrected orientation
-                var correctedPolygon = new OSGeo.OGR.Geometry(wkbGeometryType.wkbPolygon);
-                
-                // Reverse exterior ring
-                var reversedExterior = ReverseRing(exteriorRing);
-                correctedPolygon.AddGeometry(reversedExterior);
-                
-                // Add interior rings (holes) - these should be clockwise
-                int ringCount = polygon.GetGeometryCount();
-                for (int i = 1; i < ringCount; i++)
-                {
-                    var interiorRing = polygon.GetGeometryRef(i);
-                    if (!IsClockwise(interiorRing))
-                    {
-                        // Interior ring should be clockwise, so reverse it
-                        var reversedInterior = ReverseRing(interiorRing);
-                        correctedPolygon.AddGeometry(reversedInterior);
-                    }
-                    else
-                    {
-                        // Already clockwise, clone it
-                        correctedPolygon.AddGeometry(interiorRing.Clone());
-                    }
-                }
-                
-                return correctedPolygon;
-            }
-            else
-            {
-                // Exterior ring is already anti-clockwise, check interior rings
-                bool needsCorrection = false;
-                int ringCount = polygon.GetGeometryCount();
-                
-                for (int i = 1; i < ringCount; i++)
-                {
-                    var interiorRing = polygon.GetGeometryRef(i);
-                    if (!IsClockwise(interiorRing))
-                    {
-                        needsCorrection = true;
-                        break;
-                    }
-                }
-                
-                if (needsCorrection)
-                {
-                    var correctedPolygon = new OSGeo.OGR.Geometry(wkbGeometryType.wkbPolygon);
-                    correctedPolygon.AddGeometry(exteriorRing.Clone());
-                    
-                    for (int i = 1; i < ringCount; i++)
-                    {
-                        var interiorRing = polygon.GetGeometryRef(i);
-                        if (!IsClockwise(interiorRing))
-                        {
-                            var reversedInterior = ReverseRing(interiorRing);
-                            correctedPolygon.AddGeometry(reversedInterior);
-                        }
-                        else
-                        {
-                            correctedPolygon.AddGeometry(interiorRing.Clone());
-                        }
-                    }
-                    
-                    return correctedPolygon;
-                }
-                
-                return polygon; // Already correct
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Warning: Failed to correct polygon orientation: {ex.Message}");
-            return polygon; // Return original on error
-        }
-    }
-    
-    private static Geometry CorrectMultiPolygonOrientation(Geometry multiPolygon)
-    {
-        try
-        {
-            var correctedMultiPolygon = new OSGeo.OGR.Geometry(wkbGeometryType.wkbMultiPolygon);
-            int polygonCount = multiPolygon.GetGeometryCount();
-            
-            for (int i = 0; i < polygonCount; i++)
-            {
-                var polygon = multiPolygon.GetGeometryRef(i);
-                var correctedPolygon = CorrectPolygonOrientation(polygon);
-                correctedMultiPolygon.AddGeometry(correctedPolygon);
-            }
-            
-            return correctedMultiPolygon;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Warning: Failed to correct multi-polygon orientation: {ex.Message}");
-            return multiPolygon; // Return original on error
-        }
-    }
-    
-    private static bool IsClockwise(Geometry ring)
-    {
-        try
-        {
-            int pointCount = ring.GetPointCount();
-            if (pointCount < 3)
-                return false;
-                
-            double area = 0.0;
-            
-            for (int i = 0; i < pointCount - 1; i++)
-            {
-                double[] point1 = new double[2];
-                double[] point2 = new double[2];
-                
-                ring.GetPoint(i, point1);
-                ring.GetPoint(i + 1, point2);
-                
-                area += (point2[0] - point1[0]) * (point2[1] + point1[1]);
-            }
-            
-            // Positive area indicates clockwise orientation
-            return area > 0;
-        }
-        catch (Exception)
-        {
-            return false; // Assume counter-clockwise on error
-        }
-    }
-    
-    private static Geometry ReverseRing(Geometry ring)
-    {
-        try
-        {
-            var reversedRing = new OSGeo.OGR.Geometry(wkbGeometryType.wkbLinearRing);
-            int pointCount = ring.GetPointCount();
-            
-            // Add points in reverse order
-            for (int i = pointCount - 1; i >= 0; i--)
-            {
-                double[] point = new double[3]; // x, y, z
-                ring.GetPoint(i, point);
-                reversedRing.AddPoint(point[0], point[1], point[2]);
-            }
-            
-            return reversedRing;
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Warning: Failed to reverse ring: {ex.Message}");
-            return ring.Clone(); // Return clone of original on error
-        }
-    }
+
+    //private static Geometry? EnsureAntiClockwiseOrientation(Geometry? geometry)
+    //{
+    //    if (geometry == null)
+    //        return geometry;
+
+    //    var geometryType = geometry.GetGeometryType();
+
+    //    switch (geometryType)
+    //    {
+    //        case wkbGeometryType.wkbPolygon:
+    //            return CorrectPolygonOrientation(geometry);
+
+    //        case wkbGeometryType.wkbMultiPolygon:
+    //            return CorrectMultiPolygonOrientation(geometry);
+
+    //        default:
+    //            // For non-polygon geometries, return as-is
+    //            return geometry;
+    //    }
+    //}
+
+    //private static Geometry CorrectPolygonOrientation(Geometry polygon)
+    //{
+    //    try
+    //    {
+    //        // Get the exterior ring
+    //        var exteriorRing = polygon.GetGeometryRef(0);
+    //        if (exteriorRing == null)
+    //            return polygon;
+
+    //        // Check if exterior ring is clockwise (should be anti-clockwise)
+    //        if (IsClockwise(exteriorRing))
+    //        {
+    //            // Create a new polygon with corrected orientation
+    //            var correctedPolygon = new OSGeo.OGR.Geometry(wkbGeometryType.wkbPolygon);
+
+    //            // Reverse exterior ring
+    //            var reversedExterior = ReverseRing(exteriorRing);
+    //            correctedPolygon.AddGeometry(reversedExterior);
+
+    //            // Add interior rings (holes) - these should be clockwise
+    //            int ringCount = polygon.GetGeometryCount();
+    //            for (int i = 1; i < ringCount; i++)
+    //            {
+    //                var interiorRing = polygon.GetGeometryRef(i);
+    //                if (!IsClockwise(interiorRing))
+    //                {
+    //                    // Interior ring should be clockwise, so reverse it
+    //                    var reversedInterior = ReverseRing(interiorRing);
+    //                    correctedPolygon.AddGeometry(reversedInterior);
+    //                }
+    //                else
+    //                {
+    //                    // Already clockwise, clone it
+    //                    correctedPolygon.AddGeometry(interiorRing.Clone());
+    //                }
+    //            }
+
+    //            return correctedPolygon;
+    //        }
+    //        else
+    //        {
+    //            // Exterior ring is already anti-clockwise, check interior rings
+    //            bool needsCorrection = false;
+    //            int ringCount = polygon.GetGeometryCount();
+
+    //            for (int i = 1; i < ringCount; i++)
+    //            {
+    //                var interiorRing = polygon.GetGeometryRef(i);
+    //                if (!IsClockwise(interiorRing))
+    //                {
+    //                    needsCorrection = true;
+    //                    break;
+    //                }
+    //            }
+
+    //            if (needsCorrection)
+    //            {
+    //                var correctedPolygon = new OSGeo.OGR.Geometry(wkbGeometryType.wkbPolygon);
+    //                correctedPolygon.AddGeometry(exteriorRing.Clone());
+
+    //                for (int i = 1; i < ringCount; i++)
+    //                {
+    //                    var interiorRing = polygon.GetGeometryRef(i);
+    //                    if (!IsClockwise(interiorRing))
+    //                    {
+    //                        var reversedInterior = ReverseRing(interiorRing);
+    //                        correctedPolygon.AddGeometry(reversedInterior);
+    //                    }
+    //                    else
+    //                    {
+    //                        correctedPolygon.AddGeometry(interiorRing.Clone());
+    //                    }
+    //                }
+
+    //                return correctedPolygon;
+    //            }
+
+    //            return polygon; // Already correct
+    //        }
+    //    }
+    //    catch (Exception ex)
+    //    {
+    //        Console.WriteLine($"Warning: Failed to correct polygon orientation: {ex.Message}");
+    //        return polygon; // Return original on error
+    //    }
+    //}
+
+    //private static Geometry CorrectMultiPolygonOrientation(Geometry multiPolygon)
+    //{
+    //    try
+    //    {
+    //        var correctedMultiPolygon = new OSGeo.OGR.Geometry(wkbGeometryType.wkbMultiPolygon);
+    //        int polygonCount = multiPolygon.GetGeometryCount();
+
+    //        for (int i = 0; i < polygonCount; i++)
+    //        {
+    //            var polygon = multiPolygon.GetGeometryRef(i);
+    //            var correctedPolygon = CorrectPolygonOrientation(polygon);
+    //            correctedMultiPolygon.AddGeometry(correctedPolygon);
+    //        }
+
+    //        return correctedMultiPolygon;
+    //    }
+    //    catch (Exception ex)
+    //    {
+    //        Console.WriteLine($"Warning: Failed to correct multi-polygon orientation: {ex.Message}");
+    //        return multiPolygon; // Return original on error
+    //    }
+    //}
+
+    //private static bool IsClockwise(Geometry ring)
+    //{
+    //    try
+    //    {
+    //        int pointCount = ring.GetPointCount();
+    //        if (pointCount < 3)
+    //            return false;
+
+    //        double area = 0.0;
+
+    //        for (int i = 0; i < pointCount - 1; i++)
+    //        {
+    //            double[] point1 = new double[2];
+    //            double[] point2 = new double[2];
+
+    //            ring.GetPoint(i, point1);
+    //            ring.GetPoint(i + 1, point2);
+
+    //            area += (point2[0] - point1[0]) * (point2[1] + point1[1]);
+    //        }
+
+    //        // Positive area indicates clockwise orientation
+    //        return area > 0;
+    //    }
+    //    catch (Exception)
+    //    {
+    //        return false; // Assume counter-clockwise on error
+    //    }
+    //}
+
+    //private static Geometry ReverseRing(Geometry ring)
+    //{
+    //    try
+    //    {
+    //        var reversedRing = new OSGeo.OGR.Geometry(wkbGeometryType.wkbLinearRing);
+    //        int pointCount = ring.GetPointCount();
+
+    //        // Add points in reverse order
+    //        for (int i = pointCount - 1; i >= 0; i--)
+    //        {
+    //            double[] point = new double[3]; // x, y, z
+    //            ring.GetPoint(i, point);
+    //            reversedRing.AddPoint(point[0], point[1], point[2]);
+    //        }
+
+    //        return reversedRing;
+    //    }
+    //    catch (Exception ex)
+    //    {
+    //        Console.WriteLine($"Warning: Failed to reverse ring: {ex.Message}");
+    //        return ring.Clone(); // Return clone of original on error
+    //    }
+    //}
 }

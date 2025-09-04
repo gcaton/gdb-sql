@@ -16,10 +16,9 @@ try
     AnsiConsole.WriteLine();
     
     // Display platform and geometry format in a nice panel
-    var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
     var panel = new Panel(new Markup($"""
         [bold yellow]Platform:[/] {RuntimeInformation.OSDescription}
-        [bold yellow]Geometry Format:[/] {(isWindows ? "[green]SQL Geography[/]" : "[cyan]WKT with SRID column[/]")}
+        [bold yellow]Geometry Format:[/] [green]SQL Geography[/]
         [bold yellow]Multi-threading:[/] [green]Enabled[/]
         [bold yellow]Memory optimization:[/] [green]Producer-Consumer Pattern[/]
         """))

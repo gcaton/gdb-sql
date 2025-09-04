@@ -11,7 +11,6 @@ namespace GdbToSql;
 public class SqlWriter
 {
     private readonly string _connectionString;
-    private static readonly bool IsWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
     
     public SqlWriter(string connectionString)
     {
@@ -146,17 +145,9 @@ public class SqlWriter
             // Add columns with proper data types
             foreach (var kvp in firstRow)
             {
-                if (kvp.Key == "GEOMETRY" && IsWindows)
+                if (kvp.Key == "SHAPE")
                 {
-                    dataTable.Columns.Add(kvp.Key, typeof(SqlGeography));
-                }
-                else if (kvp.Key == "WKT_GEOMETRY" && !IsWindows)
-                {
-                    dataTable.Columns.Add(kvp.Key, typeof(string));
-                }
-                else if (kvp.Key == "SRID" && !IsWindows)
-                {
-                    dataTable.Columns.Add(kvp.Key, typeof(int));
+                    dataTable.Columns.Add(kvp.Key, typeof(Object));
                 }
                 else
                 {
@@ -173,9 +164,9 @@ public class SqlWriter
                 var dataRow = dataTable.NewRow();
                 foreach (var kvp in row)
                 {
-                    if (kvp.Key == "GEOMETRY" && kvp.Value is SqlGeography geog && IsWindows)
+                    if (kvp.Key == "SHAPE")
                     {
-                        dataRow[kvp.Key] = geog;
+                        dataRow[kvp.Key] = kvp.Value;
                     }
                     else if (kvp.Value == null)
                     {
@@ -229,20 +220,10 @@ public class SqlWriter
         // Add columns
         foreach (var kvp in firstRow)
         {
-            if (kvp.Key == "GEOMETRY" && IsWindows)
+            if (kvp.Key == "SHAPE")
             {
                 // Special handling for geography column on Windows
-                schemaTable.Columns.Add(kvp.Key, typeof(SqlGeography));
-            }
-            else if (kvp.Key == "WKT_GEOMETRY" && !IsWindows)
-            {
-                // WKT string on Linux
-                schemaTable.Columns.Add(kvp.Key, typeof(string));
-            }
-            else if (kvp.Key == "SRID" && !IsWindows)
-            {
-                // SRID integer on Linux
-                schemaTable.Columns.Add(kvp.Key, typeof(int));
+                schemaTable.Columns.Add(kvp.Key, typeof(Object));
             }
             else
             {
@@ -263,9 +244,9 @@ public class SqlWriter
                 var dataRow = dataTable.NewRow();
                 foreach (var kvp in row)
                 {
-                    if (kvp.Key == "GEOMETRY" && kvp.Value is SqlGeography geog && IsWindows)
+                    if (kvp.Key == "SHAPE")
                     {
-                        dataRow[kvp.Key] = geog;
+                        dataRow[kvp.Key] = kvp.Value;
                     }
                     else
                     {
@@ -339,14 +320,8 @@ public class SqlWriter
     
     private string GetSqlColumnType(string columnName, object? sampleValue)
     {
-        if (columnName == "GEOMETRY" && IsWindows)
+        if (columnName == "SHAPE")
             return "GEOGRAPHY";
-            
-        if (columnName == "WKT_GEOMETRY" && !IsWindows)
-            return "NVARCHAR(MAX)";
-            
-        if (columnName == "SRID" && !IsWindows)
-            return "INT";
             
         if (columnName == "FID")
             return "BIGINT";
@@ -484,14 +459,8 @@ public class SqlWriter
     private string GetOptimalSqlColumnType(string columnName, IEnumerable<object?> allValues)
     {
         // Handle special geometry columns
-        if (columnName == "GEOMETRY" && IsWindows)
+        if (columnName == "SHAPE")
             return "GEOGRAPHY";
-            
-        if (columnName == "WKT_GEOMETRY" && !IsWindows)
-            return "NVARCHAR(MAX)";
-            
-        if (columnName == "SRID" && !IsWindows)
-            return "INT";
             
         if (columnName == "FID")
             return "BIGINT";
