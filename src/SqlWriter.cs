@@ -222,7 +222,6 @@ public class SqlWriter
         {
             if (kvp.Key == "SHAPE")
             {
-                // Special handling for geography column on Windows
                 schemaTable.Columns.Add(kvp.Key, typeof(Object));
             }
             else
