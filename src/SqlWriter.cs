@@ -11,6 +11,8 @@ namespace GdbToSql;
 public class SqlWriter
 {
     private readonly string _connectionString;
+    private readonly Dictionary<string, SemaphoreSlim> _tableCreationLocks = new();
+    private readonly object _lockDictionaryAccess = new object();
     
     public SqlWriter(string connectionString)
     {
@@ -81,16 +83,45 @@ public class SqlWriter
             // Test database connection first
             await TestConnectionAsync();
             
-            // Create table on first batch
+            // Create table on first batch with thread-safe locking
             if (batch.IsFirstBatch && batch.Features.Count > 0)
             {
-                // Create table for first batch
-                await CreateTableIfNotExistsAsync(batch.TableName, batch.Features);
+                // Get or create a semaphore for this table
+                SemaphoreSlim tableLock;
+                lock (_lockDictionaryAccess)
+                {
+                    if (!_tableCreationLocks.TryGetValue(batch.TableName, out tableLock!))
+                    {
+                        tableLock = new SemaphoreSlim(1, 1);
+                        _tableCreationLocks[batch.TableName] = tableLock;
+                    }
+                }
+                
+                // Ensure only one thread creates the table
+                await tableLock.WaitAsync();
+                try
+                {
+                    // Create table for first batch
+                    await CreateTableIfNotExistsAsync(batch.TableName, batch.Features);
+                    
+                    // Add a small delay to ensure table is fully committed
+                    await Task.Delay(100);
+                }
+                finally
+                {
+                    tableLock.Release();
+                }
             }
             
             // Insert data if there are features
             if (batch.Features.Count > 0)
             {
+                // Wait a bit if this is the first batch to ensure table creation is complete
+                if (batch.IsFirstBatch)
+                {
+                    await Task.Delay(200);
+                }
+                
                 // Insert features silently
                 await BulkInsertStreamingAsync(batch.TableName, batch.Features);
                 
@@ -129,76 +160,106 @@ public class SqlWriter
     
     private async Task BulkInsertStreamingAsync(string tableName, List<Dictionary<string, object?>> data)
     {
-        try
+        const int maxRetries = 3;
+        int retryCount = 0;
+        Exception? lastException = null;
+        
+        while (retryCount < maxRetries)
         {
-            // Starting bulk insert silently
-            
-            using var connection = new SqlConnection(_connectionString);
-            await connection.OpenAsync();
-            
-            // Create DataTable for bulk copy
-            var dataTable = new DataTable();
-            var firstRow = data.First();
-            
-            // Creating DataTable silently
-            
-            // Add columns with proper data types
-            foreach (var kvp in firstRow)
+            try
             {
-                if (kvp.Key == "SHAPE")
-                {
-                    dataTable.Columns.Add(kvp.Key, typeof(Object));
-                }
-                else
-                {
-                    var columnType = GetOptimizedDataType(kvp.Key, kvp.Value);
-                    dataTable.Columns.Add(kvp.Key, columnType);
-                }
-            }
-            
-            // Adding rows to DataTable silently
-            
-            // Add rows with type conversion
-            foreach (var row in data)
-            {
-                var dataRow = dataTable.NewRow();
-                foreach (var kvp in row)
+                // Starting bulk insert silently
+                
+                using var connection = new SqlConnection(_connectionString);
+                await connection.OpenAsync();
+                
+                // Create DataTable for bulk copy
+                var dataTable = new DataTable();
+                var firstRow = data.First();
+                
+                // Creating DataTable silently
+                
+                // Add columns with proper data types
+                foreach (var kvp in firstRow)
                 {
                     if (kvp.Key == "SHAPE")
                     {
-                        dataRow[kvp.Key] = kvp.Value;
-                    }
-                    else if (kvp.Value == null)
-                    {
-                        dataRow[kvp.Key] = DBNull.Value;
+                        dataTable.Columns.Add(kvp.Key, typeof(Object));
                     }
                     else
                     {
-                        // Convert to appropriate data type
-                        dataRow[kvp.Key] = ConvertToAppropriateType(kvp.Key, kvp.Value, dataTable.Columns[kvp.Key]?.DataType ?? typeof(string));
+                        var columnType = GetOptimizedDataType(kvp.Key, kvp.Value);
+                        dataTable.Columns.Add(kvp.Key, columnType);
                     }
                 }
-                dataTable.Rows.Add(dataRow);
+                
+                // Adding rows to DataTable silently
+                
+                // Add rows with type conversion
+                foreach (var row in data)
+                {
+                    var dataRow = dataTable.NewRow();
+                    foreach (var kvp in row)
+                    {
+                        if (kvp.Key == "SHAPE")
+                        {
+                            dataRow[kvp.Key] = kvp.Value;
+                        }
+                        else if (kvp.Value == null)
+                        {
+                            dataRow[kvp.Key] = DBNull.Value;
+                        }
+                        else
+                        {
+                            // Convert to appropriate data type
+                            dataRow[kvp.Key] = ConvertToAppropriateType(kvp.Key, kvp.Value, dataTable.Columns[kvp.Key]?.DataType ?? typeof(string));
+                        }
+                    }
+                    dataTable.Rows.Add(dataRow);
+                }
+                
+                // Performing bulk copy silently
+                
+                // Perform bulk copy with optimizations
+                using var bulkCopy = new SqlBulkCopy(connection);
+                bulkCopy.DestinationTableName = tableName;
+                bulkCopy.BulkCopyTimeout = 300;
+                bulkCopy.BatchSize = Math.Min(data.Count, 10000);
+                bulkCopy.EnableStreaming = true;
+                bulkCopy.NotifyAfter = Math.Min(data.Count / 4, 2500);
+                
+                await bulkCopy.WriteToServerAsync(dataTable);
+                
+                // Bulk copy completed silently
+                return; // Success, exit the retry loop
             }
-            
-            // Performing bulk copy silently
-            
-            // Perform bulk copy with optimizations
-            using var bulkCopy = new SqlBulkCopy(connection);
-            bulkCopy.DestinationTableName = tableName;
-            bulkCopy.BulkCopyTimeout = 300;
-            bulkCopy.BatchSize = Math.Min(data.Count, 10000);
-            bulkCopy.EnableStreaming = true;
-            bulkCopy.NotifyAfter = Math.Min(data.Count / 4, 2500);
-            
-            await bulkCopy.WriteToServerAsync(dataTable);
-            
-            // Bulk copy completed silently
+            catch (Exception ex)
+            {
+                lastException = ex;
+                retryCount++;
+                
+                if (ex.Message.Contains("Cannot access destination table"))
+                {
+                    // Table access error - wait a bit and retry
+                    if (retryCount < maxRetries)
+                    {
+                        AnsiConsole.MarkupLine($"[yellow]⚠ Table access error for [bold]{tableName}[/], retrying ({retryCount}/{maxRetries})...[/]");
+                        await Task.Delay(500 * retryCount); // Exponential backoff
+                        continue;
+                    }
+                }
+                
+                // For other errors or max retries reached, throw immediately
+                AnsiConsole.MarkupLine($"[red]✗ Bulk insert failed for [bold]{tableName}[/]: {ex.Message.EscapeMarkup()}[/]");
+                throw;
+            }
         }
-        catch (Exception ex)
+        
+        // If we get here, we've exhausted all retries
+        if (lastException != null)
         {
-            AnsiConsole.MarkupLine($"[red]✗ Bulk insert failed for [bold]{tableName}[/]: {ex.Message.EscapeMarkup()}[/]");
-            throw;
+            AnsiConsole.MarkupLine($"[red]✗ Bulk insert failed for [bold]{tableName}[/] after {maxRetries} retries: {lastException.Message.EscapeMarkup()}[/]");
+            throw lastException;
         }
     }
 
