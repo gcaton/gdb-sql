@@ -6,15 +6,16 @@ A .NET console application that reads all records from Esri Geodatabase (GDB) fi
 
 ### **Core Functionality**
 - **Complete GDB Import** - Reads all feature classes from GDB folders automatically
-- **Intelligent Table Creation** - Creates SQL Server tables with proper data types
 - **Geometry Processing** - Handles spatial data with coordinate system support (SRID 4283 - GDA94)
 - **Cross-Platform** - Works on Windows (SQL Geography) and Linux (WKT format)
 
 ## 📋 Requirements
 
 - **.NET 9 Runtime**
-- **SQL Server** (2016+) or **SQL Server Express**
+- **SQL Server** (2016+) or **SQL Server Express** (or use provided Docker setup)
 - **Geodatabase Files** (.gdb format)
+- **Docker** (optional, for containerized SQL Server)
+- **just** command runner (optional, for simplified commands)
 
 ## ⚙️ Configuration
 
@@ -23,7 +24,7 @@ Configure the application by editing `appsettings.json`:
 ```json
 {
   "ConnectionStrings": {
-    "DefaultConnection": "Server=localhost,1435;Database=master;User Id=sa;Password=YourPassword;TrustServerCertificate=True"
+    "DefaultConnection": "Server=localhost;Database=gdb;User Id=sa;Password=pa55w0rd!;TrustServerCertificate=True"
   },
   "GdbToSql": {
     "SourceGdbPath": "NSW.gdb",
@@ -39,47 +40,49 @@ Configure the application by editing `appsettings.json`:
 
 ## 🏃‍♂️ Usage
 
-### **Basic Usage**
+### **Quick Start with Docker**
 ```bash
-dotnet run
+# Start SQL Server container
+just up
+
+# Run the application
+just run
+
+# Or do a fresh run (restart DB and run app)
+just fresh
 ```
 
-### **Build and Run**
+### **Available Commands (via justfile)**
 ```bash
-dotnet build
-dotnet run
+just up          # Start SQL Server container
+just down        # Stop and remove containers
+just restart     # Restart containers
+just build       # Build the .NET application
+just run         # Run the application
+just fresh       # Restart DB and run app
+just logs        # View SQL Server logs
+just status      # Check container status
+just test-connection  # Test SQL connection
+```
+
+### **Manual Usage**
+```bash
+# Without justfile
+cd src && dotnet run
+
+# Or with docker-compose directly
+docker-compose -f .docker/docker-compose.yml up -d
+cd src && dotnet run
 ```
 
 ### **Sample Output**
-```
-GDB to SQL Converter
-====================
-Platform: Linux
-Geometry format: WKT with SRID column
+The application provides a clean, informative console output showing:
+- System information and configuration
+- Layer discovery with feature counts
+- Real-time progress updates
+- Performance metrics and timing summary
 
-Reading from GDB: NSW.gdb
-Table prefix: NSW_
-
-Database connection successful.
-Found 33 layers with 10,923,521 total features to process
-Using dynamic batch size: 10,000 features per batch
-Using 16 producer threads and 4 consumer threads
-
-==================================================
-PERFORMANCE TIMING SUMMARY
-==================================================
-Configuration Load          : 0.02s
-Database Connection Test     : 0.15s  
-Layer Information Scan       : 2.45s
-Producer Processing          : 245.67s
-Consumer Processing          : 123.89s
-Total Data Processing        : 369.56s
-Total Application Time       : 372.18s
-==================================================
-Features per second          : 29,562
-MB processed per second      : 145.23
-==================================================
-```
+**Note**: Table creation and deletion operations are performed silently for cleaner output.
 
 ## 🗃️ Data Types
 
@@ -107,6 +110,21 @@ The application intelligently detects and converts data types:
 ### **Platform Differences**
 - **Windows**: Uses SQL Server `GEOGRAPHY` data type
 - **Linux**: Uses WKT strings with separate SRID column
+
+## 🐳 Docker Setup
+
+The project includes a Docker setup for SQL Server:
+
+### **Docker Files**
+- `.docker/Dockerfile.sqlserver` - SQL Server 2022 container with auto-initialization
+- `.docker/docker-compose.yml` - Docker Compose configuration
+- `.docker/init-db.sql` - Database initialization script (creates `gdb` database)
+
+### **Default Credentials**
+- **Database**: `gdb`
+- **Username**: `sa`
+- **Password**: `pa55w0rd!`
+- **Port**: `1433`
 
 ## 🛠️ Development
 
